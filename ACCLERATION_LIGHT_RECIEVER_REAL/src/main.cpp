@@ -2,15 +2,12 @@
   Soft Random – RECEIVER (ESP32-S3 / Seeed XIAO ESP32-S3)
 
   Impact/crash handling has been removed. This board now glows on its own: the
-  8×8 RGB matrix pulses smoothly and randomly, and the relay-driven light
-  follows that same wave (a relay can't dim, so it switches on/off with
-  hysteresis as the pulse rises and falls — a gentle, slow cycle). MIDI flashes
-  from the MIDI board (over ESP-NOW) still pop ON TOP: relay forced on, matrix
-  to the flash brightness for the flash duration.
+  8×8 RGB matrix and the MOSFET/PWM-driven light both fade smoothly with the
+  same random pulse. MIDI flashes from the MIDI board (over ESP-NOW) still pop
+  ON TOP: light + matrix jump to the flash brightness for the flash duration.
 
   Wiring:
-    RELAY_PIN -> relay module IN
-    relay COM/NO -> the light + its power supply
+    LIGHT_PIN -> MOSFET gate driving the light (PWM dimmable)
 */
 
 #include <Arduino.h>
@@ -40,6 +37,22 @@ typedef struct __attribute__((packed)) {
 } FlashCommand;
 #define FLASH_CMD_MAGIC 0xF1
 
+// -------- AUDIO LEVEL (from the Mac, via the MIDI board's BLE bridge) --------
+// 2-byte message carrying a smoothed output-audio level (0..255) that scales
+// the pulse/light brightness. Distinct from Handshake(1) and FlashCommand(5)
+// by length. Falls back to full brightness if none arrive for a while.
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;    // = LEVEL_CMD_MAGIC
+  uint8_t level;  // 0..255
+} LevelMessage;
+#define LEVEL_CMD_MAGIC 0xA1
+
+const unsigned long LEVEL_TIMEOUT_MS = 1500;  // no level this long => full bright
+
+volatile uint8_t       audioLevelRaw = 255;   // last level received (set in recv cb)
+volatile unsigned long lastLevelMs   = 0;      // when it arrived
+float                  audioLevelSmoothed = 255.0f;  // on-device EMA (bridges gaps)
+
 // Broadcast back so the sender hears the ACK. esp_now_send needs a registered
 // peer even for broadcast.
 uint8_t broadcastAddr[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -52,16 +65,12 @@ volatile bool          needAck     = false;
 bool          linkUp         = false;
 unsigned long lastRedBlinkMs = 0;
 
-// -------- RELAY / LIGHT --------
-#define RELAY_PIN         2     // GPIO driving the relay IN pin
-#define RELAY_ACTIVE_HIGH true  // true: HIGH = relay ON. Set false for active-low modules.
-#define FLASH_DURATION_MS 150   // default MIDI-flash length / fallback
-
-// Relay can't dim, so it tracks the pulse with hysteresis: turns ON when the
-// pulse rises past HIGH, OFF when it falls below LOW. The gap keeps it from
-// chattering around a single threshold.
-const uint8_t RELAY_ON_THRESHOLD  = 170;
-const uint8_t RELAY_OFF_THRESHOLD = 90;
+// -------- PWM LIGHT (GPIO 2, MOSFET-driven — same setup as the sender) --------
+#define LIGHT_PIN          2      // PWM-capable GPIO driving the light MOSFET
+#define LIGHT_PWM_FREQ     5000   // Hz
+#define LIGHT_PWM_RES_BITS 8      // 8-bit duty -> 0..255
+#define LIGHT_PWM_CHANNEL  0      // LEDC channel (core 2.x only)
+#define FLASH_DURATION_MS  150    // default MIDI-flash length / fallback
 
 // -------- LED MATRIX --------
 #define MATRIX_PIN    14
@@ -113,7 +122,6 @@ struct SmoothRandomPulse {
 };
 
 SmoothRandomPulse pulse;
-bool relayOn = false;
 
 // MIDI flash state (set in the recv callback, rendered in loop()).
 volatile bool          flashActive     = false;
@@ -123,8 +131,22 @@ volatile uint8_t       flashBrightness = 255;
 volatile uint8_t       flashVelocity   = 0;
 volatile bool          newFlash        = false;
 
-void relayWrite(bool on) {
-  digitalWrite(RELAY_PIN, (on == RELAY_ACTIVE_HIGH) ? HIGH : LOW);
+void lightWriteDuty(uint8_t duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(LIGHT_PIN, duty);
+#else
+  ledcWrite(LIGHT_PWM_CHANNEL, duty);
+#endif
+}
+
+void lightBegin() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(LIGHT_PIN, LIGHT_PWM_FREQ, LIGHT_PWM_RES_BITS);
+#else
+  ledcSetup(LIGHT_PWM_CHANNEL, LIGHT_PWM_FREQ, LIGHT_PWM_RES_BITS);
+  ledcAttachPin(LIGHT_PIN, LIGHT_PWM_CHANNEL);
+#endif
+  lightWriteDuty(0);
 }
 
 // ESP-NOW receive callback. Signature differs across Arduino-ESP32 cores.
@@ -141,6 +163,16 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
       lastHelloMs = millis();
       needAck     = true;   // reply from loop(), not here
     }
+    return;
+  }
+
+  // Audio level from the Mac (relayed by the MIDI board's BLE bridge).
+  if (len == sizeof(LevelMessage)) {
+    LevelMessage lm;
+    memcpy(&lm, data, sizeof(lm));
+    if (lm.cmd != LEVEL_CMD_MAGIC) return;
+    audioLevelRaw = lm.level;
+    lastLevelMs   = millis();
     return;
   }
 
@@ -235,8 +267,7 @@ void setup() {
   // True-random seed so two boards don't pulse in lockstep.
   randomSeed(esp_random());
 
-  pinMode(RELAY_PIN, OUTPUT);
-  relayWrite(false);   // light off at boot
+  lightBegin();        // PWM light, starts off
 
   matrix.begin();
   matrix.setBrightness(0);
@@ -276,20 +307,24 @@ void loop() {
     updateLinkStatus();
   }
 
-  // ---- SMOOTH RANDOM PULSE (base layer) ----
-  uint8_t pulseVal   = pulse.value(now);                                   // 0..255
-  uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
+  // ---- AUDIO-LEVEL MULTIPLIER ----
+  // Track the Mac's streamed level with a light EMA so dropped packets don't
+  // cause flicker; fall back to full brightness if the stream goes silent.
+  uint8_t levelTarget = (lastLevelMs != 0 && now - lastLevelMs < LEVEL_TIMEOUT_MS)
+                          ? audioLevelRaw : 255;
+  audioLevelSmoothed += ((float)levelTarget - audioLevelSmoothed) * 0.2f;
+  float audioMul = audioLevelSmoothed / 255.0f;   // 0..1
 
-  // Relay follows the pulse with hysteresis (it can only switch, not dim).
-  if (!relayOn && pulseVal >= RELAY_ON_THRESHOLD)      relayOn = true;
-  else if (relayOn && pulseVal <= RELAY_OFF_THRESHOLD) relayOn = false;
+  // ---- SMOOTH RANDOM PULSE (base layer), scaled by the audio level ----
+  uint8_t pulseVal   = (uint8_t)(pulse.value(now) * audioMul);              // 0..255
+  uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
 
   // ---- RENDER: MIDI flash overrides on top, else the pulse ----
   if (flashing) {
-    relayWrite(true);                       // relay forced on for the flash
+    lightWriteDuty(flashBrightness);        // light jumps to flash brightness
     matrix.setBrightness(flashBrightness);
   } else {
-    relayWrite(relayOn);
+    lightWriteDuty(pulseVal);               // light fades smoothly with the pulse
     matrix.setBrightness(matrixBase);
   }
   matrix.fillScreen(matrix.Color(255, 255, 255));

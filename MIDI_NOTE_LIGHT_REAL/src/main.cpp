@@ -23,6 +23,10 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+
 // -------- MIDI INPUT --------
 // The MIDI FeatherWing uses the hardware UART at 31250 baud. We put MIDI on
 // Serial1 so it stays off the USB Serial used for programming/debug. The XIAO
@@ -139,6 +143,16 @@ typedef struct __attribute__((packed)) {
 enum HandshakeType { HS_HELLO = 1, HS_ACK = 2 };
 typedef struct __attribute__((packed)) { uint8_t type; } HandshakeMessage;
 
+// Audio-level message: a Mac connects over BLE (see below) and streams a
+// smoothed output-audio level; we rebroadcast it here so the light boards can
+// use it as a brightness multiplier. 2 bytes — distinct from Handshake(1),
+// LevelMessage(2 via cmd), and FlashCommand(5) by length + magic.
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;    // = LEVEL_CMD_MAGIC
+  uint8_t level;  // 0..255 smoothed audio level (255 = full brightness)
+} LevelMessage;
+#define LEVEL_CMD_MAGIC 0xA1
+
 const unsigned long HELLO_INTERVAL_MS = 1000;
 unsigned long lastHelloSentMs = 0;
 
@@ -183,6 +197,59 @@ void espNowSendHello() {
   HandshakeMessage hs;
   hs.type = HS_HELLO;
   esp_now_send(espNowPeerMac, (const uint8_t *)&hs, sizeof(hs));
+}
+
+void espNowSendLevel(uint8_t level) {
+  if (!espNowReady) return;
+  LevelMessage lm;
+  lm.cmd   = LEVEL_CMD_MAGIC;
+  lm.level = level;
+  esp_now_send(espNowPeerMac, (const uint8_t *)&lm, sizeof(lm));
+}
+
+// -------- BLE AUDIO BRIDGE (Mac -> here -> ESP-NOW) --------
+// A host (e.g. a Mac app) connects over BLE and writes a single byte — the
+// smoothed level of its outgoing audio (0..255) — to the characteristic below,
+// at ~30-60 Hz. The write callback only stashes the value + a flag; loop()
+// rebroadcasts it over ESP-NOW so heavy work stays out of the BLE stack.
+#define AUDIO_SERVICE_UUID "9a0b0000-1234-4c6e-9b00-1f2e3d4c5b6a"
+#define AUDIO_CHAR_UUID    "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
+
+volatile uint8_t bleLevel    = 255;   // last level written by the host
+volatile bool    bleLevelNew = false; // set on write, cleared in loop()
+
+class LevelWriteCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    // Core 2.x: getData()/getValue().length() give the raw bytes.
+    uint8_t *data = c->getData();
+    size_t   len  = c->getValue().length();
+    if (data && len >= 1) {
+      bleLevel    = data[0];
+      bleLevelNew = true;
+    }
+  }
+};
+
+void bleBegin() {
+  BLEDevice::init("LightAudioBridge");
+  BLEServer  *server = BLEDevice::createServer();
+  BLEService *svc    = server->createService(AUDIO_SERVICE_UUID);
+
+  // Write-without-response so the host can stream at audio rate without waiting
+  // for an ACK per packet.
+  BLECharacteristic *ch = svc->createCharacteristic(
+      AUDIO_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ch->setCallbacks(new LevelWriteCallback());
+
+  svc->start();
+
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(AUDIO_SERVICE_UUID);
+  adv->setScanResponse(false);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE audio bridge advertising as 'LightAudioBridge'");
 }
 
 // Running total of Note On messages we've flashed for, for debug context.
@@ -255,6 +322,7 @@ void setup() {
   MidiSerial.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
 
   espNowBegin();   // WiFi/ESP-NOW radio for mirroring flashes to the receiver
+  bleBegin();      // BLE endpoint for the Mac's streamed audio level
 
 #if RAW_MIDI_DUMP
   Serial.println("=================================================");
@@ -354,6 +422,12 @@ void loop() {
   if (millis() - lastHelloSentMs >= HELLO_INTERVAL_MS) {
     lastHelloSentMs = millis();
     espNowSendHello();
+  }
+
+  // Rebroadcast the latest BLE audio level to the light boards over ESP-NOW.
+  if (bleLevelNew) {
+    bleLevelNew = false;
+    espNowSendLevel(bleLevel);
   }
 
   // Non-blocking: turn the matrix back off once the flash duration elapses.

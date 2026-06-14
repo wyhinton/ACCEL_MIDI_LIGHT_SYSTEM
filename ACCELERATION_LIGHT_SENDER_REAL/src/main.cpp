@@ -43,6 +43,23 @@ typedef struct __attribute__((packed)) {
 } FlashCommand;
 #define FLASH_CMD_MAGIC 0xF1
 
+// -------- AUDIO LEVEL (from the Mac, via the MIDI board's BLE bridge) --------
+// 2-byte message carrying a smoothed output-audio level (0..255) that scales
+// the pulse/light brightness. Distinct from Handshake(1) and FlashCommand(5)
+// by length. If none arrive for a while we fall back to full brightness so the
+// lights never go dark with no Mac connected.
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;    // = LEVEL_CMD_MAGIC
+  uint8_t level;  // 0..255
+} LevelMessage;
+#define LEVEL_CMD_MAGIC 0xA1
+
+const unsigned long LEVEL_TIMEOUT_MS = 1500;  // no level this long => full bright
+
+volatile uint8_t       audioLevelRaw = 255;   // last level received (set in recv cb)
+volatile unsigned long lastLevelMs   = 0;      // when it arrived
+float                  audioLevelSmoothed = 255.0f;  // on-device EMA (bridges gaps)
+
 // MIDI-triggered flash state (set in the recv callback, rendered in loop()).
 volatile bool          midiFlashActive     = false;
 volatile bool          newMidiFlash        = false;
@@ -82,6 +99,16 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     if (hs.type == HS_ACK) {
       lastAckMs = millis();
     }
+    return;
+  }
+
+  // Audio level from the Mac (relayed by the MIDI board's BLE bridge).
+  if (len == sizeof(LevelMessage)) {
+    LevelMessage lm;
+    memcpy(&lm, data, sizeof(lm));
+    if (lm.cmd != LEVEL_CMD_MAGIC) return;
+    audioLevelRaw = lm.level;
+    lastLevelMs   = millis();
     return;
   }
 
@@ -304,9 +331,17 @@ void loop() {
     Serial.println("ms");
   }
 
-  // ---- SMOOTH RANDOM PULSE (base layer) ----
-  uint8_t pulseVal       = pulse.value(now);                       // 0..255
-  uint8_t matrixBase     = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
+  // ---- AUDIO-LEVEL MULTIPLIER ----
+  // Track the Mac's streamed level with a light EMA so dropped packets don't
+  // cause flicker; fall back to full brightness if the stream goes silent.
+  uint8_t levelTarget = (lastLevelMs != 0 && now - lastLevelMs < LEVEL_TIMEOUT_MS)
+                          ? audioLevelRaw : 255;
+  audioLevelSmoothed += ((float)levelTarget - audioLevelSmoothed) * 0.2f;
+  float audioMul = audioLevelSmoothed / 255.0f;   // 0..1
+
+  // ---- SMOOTH RANDOM PULSE (base layer), scaled by the audio level ----
+  uint8_t pulseVal   = (uint8_t)(pulse.value(now) * audioMul);      // 0..255
+  uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
 
   // ---- RENDER MATRIX (every loop) ----
   uint8_t shown = (flashBoost > matrixBase) ? flashBoost : matrixBase;
