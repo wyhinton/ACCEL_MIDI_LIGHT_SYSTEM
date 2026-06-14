@@ -1,9 +1,12 @@
 /*
-  Impact Light – RECEIVER (ESP32-S3 / Seeed XIAO ESP32-S3)
+  Soft Random – RECEIVER (ESP32-S3 / Seeed XIAO ESP32-S3)
 
-  Listens for ESP-NOW "impact" messages broadcast by the sender board
-  (ACCELERATION_LIGHT_SENDER_REAL). Every time an impact arrives, it
-  flashes a light on/off by pulsing a relay.
+  Impact/crash handling has been removed. This board now glows on its own: the
+  8×8 RGB matrix pulses smoothly and randomly, and the relay-driven light
+  follows that same wave (a relay can't dim, so it switches on/off with
+  hysteresis as the pulse rises and falls — a gentle, slow cycle). MIDI flashes
+  from the MIDI board (over ESP-NOW) still pop ON TOP: relay forced on, matrix
+  to the flash brightness for the flash duration.
 
   Wiring:
     RELAY_PIN -> relay module IN
@@ -18,17 +21,9 @@
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 
-// -------- IMPACT MESSAGE --------
-// MUST match the sender's struct byte-for-byte, or the data is garbage.
-typedef struct __attribute__((packed)) {
-  uint32_t seq;       // increments each impact
-  float    jerk;      // measured jerk (g/frame) that triggered it
-  float    accelMag;  // acceleration magnitude at impact (g)
-} ImpactMessage;
-
 // -------- HANDSHAKE / LINK STATUS --------
-// Mirrors the sender: it beacons HELLO, we reply ACK. Both boards then know
-// the link works. Distinguished from ImpactMessage by length (1 vs 12 bytes).
+// Mirrors the sender: it beacons HELLO, we reply ACK. Distinguished from the
+// FlashCommand by length (1 byte vs 5 bytes).
 enum HandshakeType { HS_HELLO = 1, HS_ACK = 2 };
 typedef struct __attribute__((packed)) {
   uint8_t type;
@@ -36,9 +31,7 @@ typedef struct __attribute__((packed)) {
 
 // -------- FLASH COMMAND (from the MIDI board) --------
 // Velocity-scaled flash request. The MIDI board does the velocity->brightness
-// /duration mapping (single source of truth for the scaling rules) and sends
-// the resolved values here. Distinguished from the others by length:
-//   HandshakeMessage = 1 byte, FlashCommand = 5 bytes, ImpactMessage = 12 bytes.
+// /duration mapping and sends the resolved values here.
 typedef struct __attribute__((packed)) {
   uint8_t  cmd;         // = FLASH_CMD_MAGIC
   uint8_t  velocity;    // original MIDI velocity 1..127 (for logging)
@@ -60,14 +53,23 @@ bool          linkUp         = false;
 unsigned long lastRedBlinkMs = 0;
 
 // -------- RELAY / LIGHT --------
-#define RELAY_PIN        2     // GPIO driving the relay IN pin
-#define RELAY_ACTIVE_HIGH true // true: HIGH = relay ON. Set false for active-low modules.
-#define FLASH_DURATION_MS 150  // default flash length (impact msgs / fallback)
+#define RELAY_PIN         2     // GPIO driving the relay IN pin
+#define RELAY_ACTIVE_HIGH true  // true: HIGH = relay ON. Set false for active-low modules.
+#define FLASH_DURATION_MS 150   // default MIDI-flash length / fallback
+
+// Relay can't dim, so it tracks the pulse with hysteresis: turns ON when the
+// pulse rises past HIGH, OFF when it falls below LOW. The gap keeps it from
+// chattering around a single threshold.
+const uint8_t RELAY_ON_THRESHOLD  = 170;
+const uint8_t RELAY_OFF_THRESHOLD = 90;
 
 // -------- LED MATRIX --------
 #define MATRIX_PIN    14
 #define MATRIX_WIDTH  8
 #define MATRIX_HEIGHT 8
+
+// Matrix is bright at close range, so the pulse is scaled to this ceiling.
+const uint8_t MATRIX_MAX_BRIGHTNESS = 90;
 
 Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
   MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_PIN,
@@ -76,15 +78,50 @@ Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
   NEO_RGB + NEO_KHZ800
 );
 
-// Non-blocking flash state. The receive callback just records that a flash
-// was requested; loop() turns the relay off once the duration elapses.
-volatile bool          flashActive    = false;
-volatile unsigned long flashStartMs   = 0;
-volatile unsigned long flashDurationMs = FLASH_DURATION_MS; // set per request
-volatile uint8_t       flashBrightness = 255;               // set per request
-volatile uint8_t       flashVelocity  = 0;                  // for logging
-volatile uint32_t      lastSeq        = 0;
-volatile bool          newImpact      = false;
+// -------- SMOOTH RANDOM PULSE --------
+// Brightness wanders smoothly and randomly: ease from the current level toward
+// a new random target over a random duration, then pick another. smoothstep
+// easing keeps the motion gentle, with no hard corners.
+struct SmoothRandomPulse {
+  float    fromVal  = 0.0f;
+  float    toVal    = 0.0f;
+  uint32_t segStart = 0;
+  uint32_t segDur   = 1;
+  uint8_t  minVal   = 0,   maxVal   = 255;
+  uint16_t minDurMs = 600, maxDurMs = 2500;
+
+  void begin(uint8_t lo, uint8_t hi, uint16_t durLo, uint16_t durHi) {
+    minVal = lo; maxVal = hi; minDurMs = durLo; maxDurMs = durHi;
+    fromVal = toVal = lo;
+    segStart = millis();
+    segDur   = 1;   // expire immediately so the first value() picks a target
+  }
+
+  uint8_t value(uint32_t now) {
+    uint32_t elapsed = now - segStart;
+    if (elapsed >= segDur) {
+      fromVal  = toVal;
+      toVal    = random(minVal, maxVal + 1);
+      segDur   = random(minDurMs, maxDurMs + 1);
+      segStart = now;
+      elapsed  = 0;
+    }
+    float t = (float)elapsed / (float)segDur;     // 0..1
+    float e = t * t * (3.0f - 2.0f * t);          // smoothstep
+    return (uint8_t)(fromVal + (toVal - fromVal) * e);
+  }
+};
+
+SmoothRandomPulse pulse;
+bool relayOn = false;
+
+// MIDI flash state (set in the recv callback, rendered in loop()).
+volatile bool          flashActive     = false;
+volatile unsigned long flashStartMs    = 0;
+volatile unsigned long flashDurationMs = FLASH_DURATION_MS;
+volatile uint8_t       flashBrightness = 255;
+volatile uint8_t       flashVelocity   = 0;
+volatile bool          newFlash        = false;
 
 void relayWrite(bool on) {
   digitalWrite(RELAY_PIN, (on == RELAY_ACTIVE_HIGH) ? HIGH : LOW);
@@ -118,41 +155,9 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     flashVelocity   = fc.velocity;
     flashStartMs    = millis();
     flashActive     = true;
-    newImpact       = true;
+    newFlash        = true;
     return;
   }
-
-  if (len != sizeof(ImpactMessage)) {
-    // Not our message format – ignore.
-    return;
-  }
-
-  ImpactMessage msg;
-  memcpy(&msg, data, sizeof(msg));
-
-  // Start (or restart) the flash. Keep callback work minimal — the relay
-  // and matrix are driven from loop() to avoid heavy work in this context.
-  // Impacts use the default full-brightness, fixed-duration flash.
-  lastSeq         = msg.seq;
-  flashBrightness = 255;
-  flashDurationMs = FLASH_DURATION_MS;
-  flashVelocity   = 0;
-  flashStartMs    = millis();
-  flashActive     = true;
-  newImpact       = true;
-}
-
-void flashOn(uint8_t brightness) {
-  relayWrite(true);   // relay is on/off only; brightness applies to the matrix
-  matrix.setBrightness(brightness);
-  matrix.fillScreen(matrix.Color(255, 255, 255));
-  matrix.show();
-}
-
-void flashOff() {
-  relayWrite(false);
-  matrix.fillScreen(0);
-  matrix.show();
 }
 
 void sendAck() {
@@ -161,7 +166,7 @@ void sendAck() {
   esp_now_send(broadcastAddr, (const uint8_t *)&hs, sizeof(hs));
 }
 
-// Brief blocking blink of the whole matrix in one color.
+// Brief blocking blink of the whole matrix in one color (link status).
 void blinkMatrix(uint8_t r, uint8_t g, uint8_t b, int times, int onMs, int offMs) {
   for (int i = 0; i < times; i++) {
     matrix.setBrightness(120);
@@ -220,55 +225,73 @@ void initEspNow() {
     Serial.println("Failed to add ESP-NOW peer!");
   }
 
-  Serial.println("ESP-NOW ready – waiting for impact messages.");
+  Serial.println("ESP-NOW ready – link + MIDI flash enabled.");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
 
+  // True-random seed so two boards don't pulse in lockstep.
+  randomSeed(esp_random());
+
   pinMode(RELAY_PIN, OUTPUT);
   relayWrite(false);   // light off at boot
 
   matrix.begin();
-  matrix.setBrightness(255);
+  matrix.setBrightness(0);
   matrix.fillScreen(0);
   matrix.show();
 
+  // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
+  pulse.begin(0, 255, 600, 2500);
+
   initEspNow();
+
+  Serial.println("Soft random pulse running.");
 }
 
 void loop() {
+  unsigned long now = millis();
+
   // Reply to the sender's handshake beacon (queued by the recv callback).
   if (needAck) {
     needAck = false;
     sendAck();
   }
 
-  // New flash request: turn relay + LEDs on, and log (Serial/matrix in the
-  // ESP-NOW callback is risky, so we do it here).
-  if (newImpact) {
-    newImpact = false;
-    flashOn(flashBrightness);
-    if (flashVelocity > 0) {
-      Serial.print("FLASH (MIDI)  vel="); Serial.print(flashVelocity);
-      Serial.print(" bright=");           Serial.print(flashBrightness);
-      Serial.print(" dur=");              Serial.print(flashDurationMs);
-      Serial.println("ms");
-    } else {
-      Serial.print("IMPACT received  seq="); Serial.println(lastSeq);
-    }
+  if (newFlash) {
+    newFlash = false;
+    Serial.print("FLASH (MIDI)  vel="); Serial.print(flashVelocity);
+    Serial.print(" bright=");           Serial.print(flashBrightness);
+    Serial.print(" dur=");              Serial.print(flashDurationMs);
+    Serial.println("ms");
   }
 
-  // Turn the light + LEDs back off once the flash duration has elapsed.
-  if (flashActive && (millis() - flashStartMs >= flashDurationMs)) {
+  // A blocking link blink would stall the pulse, so only run link status while
+  // idle (no MIDI flash in flight) — matching the original guard.
+  bool flashing = flashActive && (now - flashStartMs < flashDurationMs);
+  if (!flashing) {
     flashActive = false;
-    flashOff();
-  }
-
-  // Connection status LEDs — only when not mid impact-flash, so they don't
-  // fight over the matrix.
-  if (!flashActive) {
     updateLinkStatus();
   }
+
+  // ---- SMOOTH RANDOM PULSE (base layer) ----
+  uint8_t pulseVal   = pulse.value(now);                                   // 0..255
+  uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
+
+  // Relay follows the pulse with hysteresis (it can only switch, not dim).
+  if (!relayOn && pulseVal >= RELAY_ON_THRESHOLD)      relayOn = true;
+  else if (relayOn && pulseVal <= RELAY_OFF_THRESHOLD) relayOn = false;
+
+  // ---- RENDER: MIDI flash overrides on top, else the pulse ----
+  if (flashing) {
+    relayWrite(true);                       // relay forced on for the flash
+    matrix.setBrightness(flashBrightness);
+  } else {
+    relayWrite(relayOn);
+    matrix.setBrightness(matrixBase);
+  }
+  matrix.fillScreen(matrix.Color(255, 255, 255));
+  matrix.show();
 }
