@@ -97,16 +97,44 @@ float mapCurved(float in, float inMin, float inMax,
   return outMin + t * (outMax - outMin);
 }
 
-// -------- POWER INDICATOR --------
-// A single dim green pixel in the bottom-right corner shows the board is
-// powered/idle. It's the resting state between flashes.
+// -------- AUDIO MULTIPLIER STATUS (BLE bridge state) --------
+// Shared with the BLE callbacks further down. Declared here so the idle render
+// just below can use them.
+const unsigned long LEVEL_TIMEOUT_MS = 1500;   // no audio this long => "idle"
+
+volatile uint8_t       bleLevel       = 255;   // last level written by the host
+volatile bool          bleLevelNew    = false; // set on write, cleared in loop()
+volatile bool          bleConnected   = false; // a BLE client is connected
+volatile unsigned long lastBleLevelMs = 0;     // last level write time
+
+// -------- IDLE / STATUS RENDER --------
+// Resting state between flashes. Column 0 (left edge) is a live meter for the
+// Mac audio bridge: color shows the link (red = no BLE host, blue = connected
+// but no audio, green = streaming), height shows the current level. A dim green
+// pixel in the bottom-right corner is the power/idle indicator.
 #define POWER_LED_BRIGHTNESS 40   // dim so it isn't distracting (0..255)
 
-void showPowerIndicator() {
+void showStatus() {
   matrix.setBrightness(POWER_LED_BRIGHTNESS);
   matrix.fillScreen(0);
-  // Bottom-right corner pixel.
-  matrix.drawPixel(MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1, matrix.Color(0, 255, 0));
+
+  if (!bleConnected) {
+    matrix.drawPixel(0, MATRIX_HEIGHT - 1, matrix.Color(255, 0, 0));   // red: no host
+  } else {
+    bool     streaming = (millis() - lastBleLevelMs) < LEVEL_TIMEOUT_MS;
+    uint32_t on  = streaming ? matrix.Color(0, 255, 0) : matrix.Color(0, 0, 255);
+    uint32_t dim = streaming ? matrix.Color(0,  40, 0) : matrix.Color(0, 0,  40);
+    int lit = ((int)bleLevel * MATRIX_HEIGHT + 127) / 255;             // 0..8 rounded
+    if (lit <= 0) {
+      matrix.drawPixel(0, MATRIX_HEIGHT - 1, dim);                     // connected, silent
+    } else {
+      for (int i = 0; i < lit; i++) {
+        matrix.drawPixel(0, MATRIX_HEIGHT - 1 - i, on);                // fill bottom-up
+      }
+    }
+  }
+
+  matrix.drawPixel(MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1, matrix.Color(0, 255, 0)); // power dot
   matrix.show();
 }
 
@@ -116,9 +144,9 @@ void flashOn(uint8_t brightness) {
   matrix.show();
 }
 
-// Resting state after a flash: just the green power dot, not full black.
+// Resting state after a flash: the status column + power dot, not full black.
 void flashOff() {
-  showPowerIndicator();
+  showStatus();
 }
 
 // -------- ESP-NOW (mirror the flash to the receiver board) --------
@@ -215,8 +243,8 @@ void espNowSendLevel(uint8_t level) {
 #define AUDIO_SERVICE_UUID "9a0b0000-1234-4c6e-9b00-1f2e3d4c5b6a"
 #define AUDIO_CHAR_UUID    "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
 
-volatile uint8_t bleLevel    = 255;   // last level written by the host
-volatile bool    bleLevelNew = false; // set on write, cleared in loop()
+// bleLevel / bleLevelNew / bleConnected / lastBleLevelMs are declared up top so
+// the idle/status render can read them.
 
 class LevelWriteCallback : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
@@ -224,15 +252,24 @@ class LevelWriteCallback : public BLECharacteristicCallbacks {
     uint8_t *data = c->getData();
     size_t   len  = c->getValue().length();
     if (data && len >= 1) {
-      bleLevel    = data[0];
-      bleLevelNew = true;
+      bleLevel       = data[0];
+      bleLevelNew    = true;
+      lastBleLevelMs = millis();
     }
   }
+};
+
+// Track connection state for the status column, and re-arm advertising after a
+// disconnect (otherwise the host can't reconnect without a reboot).
+class BridgeServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s) override    { bleConnected = true; }
+  void onDisconnect(BLEServer *s) override { bleConnected = false; BLEDevice::startAdvertising(); }
 };
 
 void bleBegin() {
   BLEDevice::init("LightAudioBridge");
   BLEServer  *server = BLEDevice::createServer();
+  server->setCallbacks(new BridgeServerCallbacks());
   BLEService *svc    = server->createService(AUDIO_SERVICE_UUID);
 
   // Write-without-response so the host can stream at audio rate without waiting
@@ -316,7 +353,7 @@ void setup() {
   delay(500);
 
   matrix.begin();
-  showPowerIndicator();   // green corner dot = powered/idle
+  showStatus();           // idle render: status column + power dot
 
   // Standard MIDI baud is 31250. Map Serial1 onto the chosen pins.
   MidiSerial.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
@@ -436,6 +473,13 @@ void loop() {
     flashOff();
     Serial.print("["); Serial.print(millis());
     Serial.println(" ms] FLASH OFF");
+  }
+
+  // Keep the idle status column live — level/link change without a flash.
+  static unsigned long lastStatusMs = 0;
+  if (!flashActive && millis() - lastStatusMs >= 50) {
+    lastStatusMs = millis();
+    showStatus();
   }
 
   // Periodic alive ping with a running count of notes seen so far.
