@@ -6,7 +6,10 @@
     {
       "label": "Upload to Sender",
       "type": "shell",
-      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "command": "pio",
+      "windows": {
+        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
+      },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCELERATION_LIGHT_SENDER_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -15,7 +18,10 @@
     {
       "label": "Upload to Receiver",
       "type": "shell",
-      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "command": "pio",
+      "windows": {
+        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
+      },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCLERATION_LIGHT_RECIEVER_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -24,22 +30,52 @@
     {
       "label": "Upload to Midi Light",
       "type": "shell",
-      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "command": "pio",
+      "windows": {
+        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
+      },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Run Audio Bridge",
+      "type": "shell",
+      "command": "python3",
+      "windows": {
+        "command": "python"
+      },
+      "args": ["${workspaceFolder}/host/audio_bridge.py", "--device", "${input:audioDevice}"],
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
+    },
+    {
+      "label": "Git Pull",
+      "type": "shell",
+      "command": "git pull",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Quick Commit & Push",
       "type": "shell",
-      "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
-      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "command": "git add -A && git commit -m '${input:commitMessage}' && git push",
+      "windows": {
+        "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
+        "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } }
+      },
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     }
   ],
   "inputs": [
+    {
+      "id": "audioDevice",
+      "type": "promptString",
+      "description": "Audio input device name or index (e.g. BlackHole). Leave blank for system default.",
+      "default": "BlackHole"
+    },
     {
       "id": "commitMessage",
       "type": "promptString",

@@ -45,31 +45,49 @@ _level = 0.0
 
 
 def make_audio_callback(gain: float):
+    _block_count = [0]
     def callback(indata, frames, time_info, status):
         global _level
         if status:
-            print(status, file=sys.stderr)
-        # RMS of this block across all channels, scaled by gain and clamped.
+            print(f"[audio] stream status: {status}", file=sys.stderr)
         rms = float(np.sqrt(np.mean(np.square(indata, dtype=np.float64))))
         target = min(rms * gain, 1.0)
         coeff = ATTACK if target > _level else RELEASE
         _level += (target - _level) * coeff
+        _block_count[0] += 1
+        if _block_count[0] % 100 == 0:
+            bar = "#" * int(_level * 40)
+            print(f"[audio] rms={rms:.4f}  gain={gain:.1f}  target={target:.3f}  "
+                  f"level={_level:.3f}  [{bar:<40}]")
     return callback
 
 
 def list_devices():
-    print(sd.query_devices())
+    print("\nAvailable audio devices:")
+    print("-" * 60)
+    for idx, dev in enumerate(sd.query_devices()):
+        direction = []
+        if dev["max_input_channels"] > 0:
+            direction.append(f"in:{dev['max_input_channels']}ch")
+        if dev["max_output_channels"] > 0:
+            direction.append(f"out:{dev['max_output_channels']}ch")
+        print(f"  [{idx:2d}] {dev['name']:<40} {' '.join(direction)}")
+    print("-" * 60)
 
 
 async def find_bridge(timeout: float):
-    print(f"Scanning for '{DEVICE_NAME}'...")
+    print(f"[ble] Scanning for '{DEVICE_NAME}' (timeout={timeout}s)...")
     dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=timeout)
     if dev is None:
-        # Fall back to matching by advertised service UUID.
+        print(f"[ble] Name scan came up empty — falling back to service UUID scan...")
         dev = await BleakScanner.find_device_by_filter(
             lambda d, adv: SERVICE_UUID.lower() in [u.lower() for u in adv.service_uuids],
             timeout=timeout,
         )
+    if dev:
+        print(f"[ble] Found device: {dev.name}  address={dev.address}")
+    else:
+        print(f"[ble] No device found after {timeout}s.")
     return dev
 
 
