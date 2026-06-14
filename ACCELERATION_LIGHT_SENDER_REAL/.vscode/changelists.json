@@ -1,0 +1,12 @@
+{
+  "changelists": [
+    {
+      "name": "Default",
+      "files": [
+        "src/main.cpp",
+        ".vscode/changelists.json"
+      ]
+    }
+  ],
+  "active": "Default"
+}
