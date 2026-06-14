@@ -31,7 +31,24 @@ If no level arrives for `LEVEL_TIMEOUT_MS` (1500 ms) the light boards fall back
 to full brightness (multiplier = 1.0), so closing the app just restores the
 plain pulse rather than going dark.
 
-## Mac app outline (Swift)
+## Host script (Python — easiest)
+
+A ready-to-run Python bridge lives in [`host/audio_bridge.py`](../host/audio_bridge.py):
+
+```bash
+pip install -r host/requirements.txt
+python host/audio_bridge.py --list-devices          # find your input
+python host/audio_bridge.py --device "BlackHole"     # capture + stream over BLE
+```
+
+It captures an audio **input** device, computes a smoothed RMS envelope, and
+writes the level byte over BLE at ~40 Hz using `bleak` + `sounddevice`.
+
+Because Python can't grab macOS *system output* directly, route output through a
+virtual loopback (BlackHole) and capture that device. On Windows you can point
+`--device` at "Stereo Mix"/a WASAPI loopback to test the BLE path without a Mac.
+
+## Mac app outline (Swift — driverless alternative)
 
 1. **Capture system output audio.** Options, newest first:
    - `ScreenCaptureKit` audio capture (macOS 13+) — no driver install.
