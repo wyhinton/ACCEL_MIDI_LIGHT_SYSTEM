@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "bleak>=0.22",
+#   "sounddevice>=0.4.6",
+#   "numpy>=1.24",
+# ]
+# ///
 """
 Audio -> BLE bridge for the ACCEL/MIDI light system.
 

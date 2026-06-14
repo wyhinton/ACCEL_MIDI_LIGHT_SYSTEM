@@ -42,11 +42,8 @@
     {
       "label": "Run Audio Bridge",
       "type": "shell",
-      "command": "python3",
-      "windows": {
-        "command": "python"
-      },
-      "args": ["${workspaceFolder}/host/audio_bridge.py", "--device", "${input:audioDevice}"],
+      "command": "uv",
+      "args": ["run", "${workspaceFolder}/host/audio_bridge.py", "--device", "${input:audioDevice}"],
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
