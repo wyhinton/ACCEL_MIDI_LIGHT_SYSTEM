@@ -1,0 +1,72 @@
+{
+  // PlatformIO upload tasks, one per board. Run via Terminal > Run Task...
+  // Each builds and flashes the firmware for that project directory.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Upload to Sender",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCELERATION_LIGHT_SENDER_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload to Receiver",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCLERATION_LIGHT_RECIEVER_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload to Midi Light",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload to ALL (swap USB when prompted)",
+      "type": "shell",
+      "command": "powershell.exe",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "args": [
+        "$pio = \"${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe\";",
+        "$projects = [ordered]@{ 'Sender' = 'ACCELERATION_LIGHT_SENDER_REAL'; 'Receiver' = 'ACCLERATION_LIGHT_RECIEVER_REAL'; 'Midi Light' = 'MIDI_NOTE_LIGHT_REAL' };",
+        "$i = 0; $n = $projects.Count;",
+        "foreach ($name in $projects.Keys) {",
+        "  $i++;",
+        "  Read-Host \"[$i/$n] Connect the '$name' board via USB, then press Enter\";",
+        "  & $pio run --target upload --project-dir \"${workspaceFolder}/$($projects[$name])\";",
+        "  if (-not $?) { Write-Host \"Upload to '$name' FAILED. Aborting.\" -ForegroundColor Red; exit 1 }",
+        "  Write-Host \"Uploaded to '$name'.\" -ForegroundColor Green;",
+        "}",
+        "Write-Host 'All boards flashed.' -ForegroundColor Green"
+      ],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Quick Commit & Push",
+      "type": "shell",
+      "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "commitMessage",
+      "type": "promptString",
+      "description": "Commit message",
+      "default": "quick commit"
+    }
+  ]
+}

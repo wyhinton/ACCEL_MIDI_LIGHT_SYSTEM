@@ -174,6 +174,22 @@ void blinkMatrix(uint8_t r, uint8_t g, uint8_t b, int times, int onMs, int offMs
   }
 }
 
+// Show a single identity letter on the matrix for a moment (startup banner).
+// The built-in 5x7 GFX font fits one character in the 8x8 grid.
+void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
+  matrix.setBrightness(120);
+  matrix.fillScreen(0);
+  matrix.setTextWrap(false);
+  matrix.setTextSize(1);
+  matrix.setTextColor(matrix.Color(r, g, b));
+  matrix.setCursor(2, 1);   // roughly center the 5x7 glyph in the 8x8 grid
+  matrix.print(c);
+  matrix.show();
+  delay(holdMs);
+  matrix.fillScreen(0);
+  matrix.show();
+}
+
 // Show link status: green burst the instant a HELLO link comes up, occasional
 // red while no HELLO has been heard recently.
 void updateLinkStatus() {
@@ -234,6 +250,9 @@ void setup() {
   matrix.setBrightness(255);
   matrix.fillScreen(0);
   matrix.show();
+
+  // Startup banner: 'R' identifies this board as the RECEIVER.
+  showStartupLetter('R', 0, 0, 255, 1000);
 
   initEspNow();
 }
