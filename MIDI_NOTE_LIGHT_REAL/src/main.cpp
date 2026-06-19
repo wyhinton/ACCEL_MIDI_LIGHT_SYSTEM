@@ -2,8 +2,9 @@
   MIDI Note Flash – ESP32-S3 / Seeed XIAO ESP32-S3
 
   Watches a serial MIDI input for Note On messages. Every time a Note On
-  arrives (with non-zero velocity), the whole 8x8 RGB LED matrix flashes
-  white for a short period, then turns back off.
+  arrives (on channel 1, with non-zero velocity), the relay pulses on for a
+  short period, then turns back off. The matrix does not pulse: it shows an
+  'M' identity banner at startup and then a dim green power dot at rest.
 
   Hardware:
     - Seeed XIAO ESP32-S3
@@ -120,17 +121,30 @@ void showPowerIndicator() {
   matrix.show();
 }
 
-void flashOn(uint8_t brightness) {
-  relayWrite(true);   // close the relay for the duration of the flash
-  matrix.setBrightness(brightness);
-  matrix.fillScreen(matrix.Color(255, 255, 255));
+// Show a single identity letter on the matrix for a moment (startup banner).
+// The built-in 5x7 GFX font fits one character in the 8x8 grid.
+void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
+  matrix.setBrightness(120);
+  matrix.fillScreen(0);
+  matrix.setTextWrap(false);
+  matrix.setTextSize(1);
+  matrix.setTextColor(matrix.Color(r, g, b));
+  matrix.setCursor(2, 1);   // roughly center the 5x7 glyph in the 8x8 grid
+  matrix.print(c);
+  matrix.show();
+  delay(holdMs);
+  matrix.fillScreen(0);
   matrix.show();
 }
 
-// Resting state after a flash: just the green power dot, not full black.
+// The flash is relay-only — the matrix no longer pulses white. It stays on its
+// resting power dot throughout.
+void flashOn() {
+  relayWrite(true);    // close the relay for the duration of the flash
+}
+
 void flashOff() {
   relayWrite(false);   // reopen the relay
-  showPowerIndicator();
 }
 
 // -------- ESP-NOW (mirror the flash to the receiver board) --------
@@ -224,7 +238,7 @@ void handleNoteOn(byte channel, byte note, byte velocity) {
   unsigned long duration   = (unsigned long)mapCurved(velocity, VEL_MIN, VEL_MAX,
                                FLASH_DUR_MIN_MS, FLASH_DUR_MAX_MS, FLASH_DUR_CURVE);
 
-  flashOn(brightness);
+  flashOn();
   flashActive     = true;
   flashStartMs    = millis();
   flashDurationMs = duration;
@@ -272,6 +286,10 @@ void setup() {
   relayWrite(false);      // light off at boot
 
   matrix.begin();
+
+  // Startup banner: 'M' identifies this board as the MIDI note light.
+  showStartupLetter('M', 0, 0, 255, 1000);
+
   showPowerIndicator();   // green corner dot = powered/idle
 
   // Standard MIDI baud is 31250. Map Serial1 onto the chosen pins.
@@ -346,7 +364,7 @@ void loop() {
     // pinned on by continuous traffic. (Raw mode can't see velocity here, so
     // it uses a fixed full-brightness blip.)
     if ((b & 0xF0) == 0x90) {
-      flashOn(FLASH_BRIGHT_MAX);
+      flashOn();
       flashActive     = true;
       flashStartMs    = millis();
       flashDurationMs = FLASH_DUR_MIN_MS;
