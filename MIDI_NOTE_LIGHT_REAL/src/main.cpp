@@ -8,6 +8,8 @@
   Hardware:
     - Seeed XIAO ESP32-S3
     - 8x8 WS2812 / NeoPixel matrix on MATRIX_PIN
+    - Relay module on RELAY_PIN (mirrors the receiver board): relay IN -> RELAY_PIN,
+      relay COM/NO -> the light + its supply. Pulsed on for the duration of each flash.
     - MIDI input (e.g. MIDI FeatherWing) wired to the UART used by Serial1
 
   MIDI plumbing follows the Adafruit MIDI FeatherWing note player example.
@@ -59,6 +61,18 @@ Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
   NEO_RGB + NEO_KHZ800
 );
 
+// -------- RELAY / LIGHT --------
+// A relay is driven in lockstep with the matrix flash, mirroring the receiver
+// board: the relay closes on a Note On (channel 1) and reopens when the flash
+// duration elapses. Relay is on/off only, so velocity scales the matrix
+// brightness/duration but not the relay (it just follows the flash window).
+#define RELAY_PIN         2     // GPIO driving the relay IN pin (D1 on the XIAO)
+#define RELAY_ACTIVE_HIGH true  // true: HIGH = relay ON. Set false for active-low modules.
+
+void relayWrite(bool on) {
+  digitalWrite(RELAY_PIN, (on == RELAY_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
 // -------- FLASH SCALING (by velocity) --------
 // MIDI velocity (1..127) is mapped onto two output ranges — brightness and
 // duration — each shaped by a curve exponent:
@@ -107,6 +121,7 @@ void showPowerIndicator() {
 }
 
 void flashOn(uint8_t brightness) {
+  relayWrite(true);   // close the relay for the duration of the flash
   matrix.setBrightness(brightness);
   matrix.fillScreen(matrix.Color(255, 255, 255));
   matrix.show();
@@ -114,6 +129,7 @@ void flashOn(uint8_t brightness) {
 
 // Resting state after a flash: just the green power dot, not full black.
 void flashOff() {
+  relayWrite(false);   // reopen the relay
   showPowerIndicator();
 }
 
@@ -190,6 +206,10 @@ unsigned long noteOnCount = 0;
 
 // Called by the MIDI library for every Note On message.
 void handleNoteOn(byte channel, byte note, byte velocity) {
+  // Only flash for channel 1. MIDI.begin(1) already filters to channel 1, but
+  // guard explicitly so the relay never fires on other channels.
+  if (channel != 1) return;
+
   // A Note On with velocity 0 is the conventional "note off" — ignore it.
   if (velocity == 0) {
     Serial.print("[");      Serial.print(millis());
@@ -247,6 +267,9 @@ void handleOtherMessage(const midi::Message<128> &msg) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  relayWrite(false);      // light off at boot
 
   matrix.begin();
   showPowerIndicator();   // green corner dot = powered/idle
