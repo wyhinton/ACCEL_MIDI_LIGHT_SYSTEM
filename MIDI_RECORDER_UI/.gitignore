@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+# recorded takes / exports
+*.json
+*.mid
+!requirements.txt
