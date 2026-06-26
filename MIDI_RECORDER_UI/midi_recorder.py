@@ -28,6 +28,7 @@ Protocol (must match MIDI_NOTE_LIGHT_REAL/src/main.cpp):
 import json
 import os
 import queue
+import socket
 import struct
 import threading
 import time
@@ -43,6 +44,11 @@ except ImportError:  # pragma: no cover - import guard for a friendlier message
     )
 
 BAUD = 115200
+# SoftAP defaults baked into the firmware (MIDI_NOTE_LIGHT_REAL/src/main.cpp).
+WIFI_SSID = "MIDI-Recorder"
+WIFI_PASS = "midi1234"
+WIFI_HOST = "192.168.4.1"   # board's SoftAP IP
+WIFI_PORT = 5000
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
@@ -116,6 +122,74 @@ class SerialLink:
             return False
 
 
+class TcpLink:
+    """WiFi transport: a TCP socket to the board's SoftAP. Same interface as
+    SerialLink (open/close/write_line/is_open + a background line reader) so the
+    app is transport-agnostic."""
+
+    def __init__(self, line_queue: "queue.Queue"):
+        self.line_queue = line_queue
+        self.sock: "socket.socket | None" = None
+        self._reader: "threading.Thread | None" = None
+        self._stop = threading.Event()
+
+    @property
+    def is_open(self) -> bool:
+        return self.sock is not None
+
+    def open(self, host: str, port: int):
+        self.close()
+        sock = socket.create_connection((host, port), timeout=5.0)
+        sock.settimeout(0.2)            # so the reader can poll _stop
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock = sock
+        self._stop.clear()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def close(self):
+        self._stop.set()
+        if self._reader and self._reader.is_alive():
+            self._reader.join(timeout=1.0)
+        self._reader = None
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.sock = None
+
+    def _read_loop(self):
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                chunk = self.sock.recv(512)
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                self.line_queue.put(("error", f"tcp read failed: {exc}"))
+                break
+            if not chunk:                # peer closed
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                text = raw.decode("utf-8", "replace").strip("\r\n")
+                if text:
+                    self.line_queue.put(("line", text))
+        self.line_queue.put(("closed", ""))
+
+    def write_line(self, text: str) -> bool:
+        if not self.is_open:
+            return False
+        try:
+            self.sock.sendall((text + "\n").encode("ascii", "ignore"))
+            return True
+        except Exception as exc:
+            self.line_queue.put(("error", f"tcp write failed: {exc}"))
+            return False
+
+
 # =====================================================================
 #  Standard MIDI File export (no external deps).
 # =====================================================================
@@ -186,11 +260,14 @@ class RecorderApp:
         root.minsize(820, 560)
 
         self.line_queue: "queue.Queue" = queue.Queue()
-        self.link = SerialLink(self.line_queue)
+        self.serial_link = SerialLink(self.line_queue)
+        self.tcp_link = TcpLink(self.line_queue)
+        self.transport = tk.StringVar(value="USB Serial")
+        self.link = self.serial_link   # active transport; reassigned on connect
 
         # recording state
         self.recording = False
-        self.rec_start = 0.0
+        self.rec_start_ms: "int | None" = None  # board ms of first recorded event
         self.events: list = []          # captured events (current take)
         self.active_notes: dict = {}    # (ch, note) -> velocity, for live display
 
@@ -223,23 +300,48 @@ class RecorderApp:
         conn = ttk.LabelFrame(self.root, text="Connection")
         conn.pack(fill="x", **pad)
 
-        ttk.Label(conn, text="Port:").grid(row=0, column=0, padx=4, pady=6, sticky="w")
-        self.port_cb = ttk.Combobox(conn, width=34, state="readonly")
-        self.port_cb.grid(row=0, column=1, padx=4, pady=6)
-        ttk.Button(conn, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=4)
+        # Transport selector (USB Serial vs WiFi TCP).
+        ttk.Label(conn, text="Via:").grid(row=0, column=0, padx=4, pady=6, sticky="w")
+        self.transport_cb = ttk.Combobox(conn, width=11, state="readonly",
+                                          values=["USB Serial", "WiFi (TCP)"],
+                                          textvariable=self.transport)
+        self.transport_cb.grid(row=0, column=1, padx=4, pady=6)
+        self.transport_cb.bind("<<ComboboxSelected>>", lambda e: self._update_transport_fields())
+
+        # Serial-only widgets.
+        self.port_lbl = ttk.Label(conn, text="Port:")
+        self.port_lbl.grid(row=0, column=2, padx=(8, 2), sticky="w")
+        self.port_cb = ttk.Combobox(conn, width=30, state="readonly")
+        self.port_cb.grid(row=0, column=3, padx=2, pady=6)
+        self.refresh_btn = ttk.Button(conn, text="Refresh", command=self.refresh_ports)
+        self.refresh_btn.grid(row=0, column=4, padx=4)
+
+        # WiFi-only widgets (hidden until WiFi is selected).
+        self.host_lbl = ttk.Label(conn, text="Host:")
+        self.host_entry = ttk.Entry(conn, width=15)
+        self.host_entry.insert(0, WIFI_HOST)
+        self.port_entry = ttk.Entry(conn, width=6)
+        self.port_entry.insert(0, str(WIFI_PORT))
+
         self.connect_btn = ttk.Button(conn, text="Connect", command=self.toggle_connect)
-        self.connect_btn.grid(row=0, column=3, padx=4)
+        self.connect_btn.grid(row=0, column=7, padx=4)
 
         self.status_dot = tk.Canvas(conn, width=16, height=16, highlightthickness=0)
-        self.status_dot.grid(row=0, column=4, padx=(14, 4))
+        self.status_dot.grid(row=0, column=8, padx=(14, 4))
         self._dot = self.status_dot.create_oval(2, 2, 14, 14, fill="#999", outline="")
         self.status_lbl = ttk.Label(conn, text="Disconnected")
-        self.status_lbl.grid(row=0, column=5, padx=4, sticky="w")
+        self.status_lbl.grid(row=0, column=9, padx=4, sticky="w")
 
-        ttk.Button(conn, text="PING", command=self.send_ping).grid(row=0, column=6, padx=4)
+        ttk.Button(conn, text="PING", command=self.send_ping).grid(row=0, column=10, padx=4)
         self.counters_lbl = ttk.Label(conn, text="in=0  out=0  err=0")
-        self.counters_lbl.grid(row=0, column=7, padx=12, sticky="e")
-        conn.columnconfigure(7, weight=1)
+        self.counters_lbl.grid(row=0, column=11, padx=12, sticky="e")
+        conn.columnconfigure(11, weight=1)
+
+        # A second row holds a hint about the SoftAP credentials for WiFi mode.
+        self.wifi_hint = ttk.Label(
+            conn, foreground="#777",
+            text=f"WiFi: join SSID \"{WIFI_SSID}\" (pass \"{WIFI_PASS}\"), then Connect to {WIFI_HOST}:{WIFI_PORT}")
+        self._update_transport_fields()
 
         # ---- Main split: left = transport + active notes, right = console ----
         body = ttk.Frame(self.root)
@@ -314,6 +416,26 @@ class RecorderApp:
         ttk.Button(cmdf, text="Send", command=self.send_manual).pack(side="left")
 
     # ---------------- Connection ----------------
+    def _is_wifi(self) -> bool:
+        return self.transport.get().startswith("WiFi")
+
+    def _update_transport_fields(self):
+        """Show the Port widgets for Serial, or the Host/Port widgets for WiFi."""
+        wifi = self._is_wifi()
+        # Serial widgets occupy columns 2..4; WiFi widgets reuse them.
+        for w in (self.port_lbl, self.port_cb, self.refresh_btn):
+            w.grid_remove() if wifi else w.grid()
+        if wifi:
+            self.host_lbl.grid(row=0, column=2, padx=(8, 2), sticky="w")
+            self.host_entry.grid(row=0, column=3, padx=2, sticky="w")
+            self.port_entry.grid(row=0, column=4, padx=2, sticky="w")
+            self.wifi_hint.grid(row=1, column=0, columnspan=12, padx=6, pady=(0, 4), sticky="w")
+        else:
+            self.host_lbl.grid_remove()
+            self.host_entry.grid_remove()
+            self.port_entry.grid_remove()
+            self.wifi_hint.grid_remove()
+
     def refresh_ports(self):
         ports = list_ports.comports()
         items = [f"{p.device}  —  {p.description}" for p in ports]
@@ -328,23 +450,51 @@ class RecorderApp:
             self.link.close()
             self.set_status(False)
             self.connect_btn.config(text="Connect")
+            self._set_transport_enabled(True)
             self.log("Disconnected.", "sys")
             return
-        sel = self.port_cb.get()
-        port = getattr(self, "_port_map", {}).get(sel, sel.split(" ")[0] if sel else "")
-        if not port:
-            messagebox.showwarning("No port", "Select a serial port first.")
-            return
-        try:
-            self.link.open(port, BAUD)
-        except Exception as exc:
-            messagebox.showerror("Connect failed", str(exc))
-            self.log(f"Connect failed: {exc}", "err")
-            return
+
+        if self._is_wifi():
+            self.link = self.tcp_link
+            host = self.host_entry.get().strip() or WIFI_HOST
+            try:
+                port = int(self.port_entry.get().strip() or WIFI_PORT)
+            except ValueError:
+                messagebox.showwarning("Bad port", "TCP port must be a number.")
+                return
+            try:
+                self.link.open(host, port)
+            except Exception as exc:
+                messagebox.showerror("Connect failed",
+                                     f"Couldn't reach {host}:{port}\n\n{exc}\n\n"
+                                     f"Joined the \"{WIFI_SSID}\" WiFi network?")
+                self.log(f"WiFi connect failed: {exc}", "err")
+                return
+            target = f"{host}:{port}"
+        else:
+            self.link = self.serial_link
+            sel = self.port_cb.get()
+            port = getattr(self, "_port_map", {}).get(sel, sel.split(" ")[0] if sel else "")
+            if not port:
+                messagebox.showwarning("No port", "Select a serial port first.")
+                return
+            try:
+                self.link.open(port, BAUD)
+            except Exception as exc:
+                messagebox.showerror("Connect failed", str(exc))
+                self.log(f"Connect failed: {exc}", "err")
+                return
+            target = f"{port} @ {BAUD}"
+
         self.set_status(True, "Connecting…")
         self.connect_btn.config(text="Disconnect")
+        self._set_transport_enabled(False)
         self.last_rx_time = time.monotonic()
-        self.log(f"Opened {port} @ {BAUD}.", "sys")
+        self.log(f"Opened {target}.", "sys")
+
+    def _set_transport_enabled(self, enabled: bool):
+        # Lock the transport selector while connected so link/active don't diverge.
+        self.transport_cb.config(state="readonly" if enabled else "disabled")
 
     def set_status(self, connected: bool, text: str = None):
         if connected:
@@ -371,7 +521,8 @@ class RecorderApp:
                 elif kind == "closed":
                     self.set_status(False)
                     self.connect_btn.config(text="Connect")
-                    self.log("Serial port closed.", "sys")
+                    self._set_transport_enabled(True)
+                    self.log("Link closed.", "sys")
                 elif kind == "error":
                     self.log(payload, "err")
         except queue.Empty:
@@ -416,10 +567,13 @@ class RecorderApp:
         except ValueError:
             return
 
-        # Record (host clock relative to record start).
+        # Record using the BOARD's timestamp (the ms field), not host arrival
+        # time, so WiFi/USB latency and jitter don't smear the captured timing.
         if self.recording:
+            if self.rec_start_ms is None:
+                self.rec_start_ms = ms          # anchor on the first event
             self.events.append({
-                "t": time.monotonic() - self.rec_start,
+                "t": max(0.0, (ms - self.rec_start_ms) / 1000.0),
                 "ms": ms, "type": etype, "ch": ch, "d1": d1, "d2": d2,
             })
             self.rec_status.config(text=f"● REC — {len(self.events)} events")
@@ -469,7 +623,7 @@ class RecorderApp:
                 return
             self.events = []
             self.recording = True
-            self.rec_start = time.monotonic()
+            self.rec_start_ms = None   # anchored on the first event's board ms
             self.record_btn.config(text="■ Stop Rec")
             self.rec_status.config(text="● REC — 0 events")
             self.log("Recording started.", "sys")

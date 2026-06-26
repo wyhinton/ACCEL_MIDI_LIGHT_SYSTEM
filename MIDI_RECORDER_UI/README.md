@@ -9,13 +9,17 @@ MIDI ⇄ USB bridge.
   MIDI controller / keyboard
         │  (DIN MIDI, 31250 baud)
         ▼
-  MIDI FeatherWing ── Serial1 ──▶ ESP32-S3 ──(USB 115200, ASCII lines)──▶ this app
-                                     ▲                                         │
+  MIDI FeatherWing ── Serial1 ──▶ ESP32-S3 ──┬─ USB 115200 ───────────▶ this app
+                                     ▲        └─ WiFi SoftAP + TCP 5000 ─▶ (pick one)
                                      └──────────── playback commands ◀─────────┘
                                                        │
                                                        ▼
                                             MIDI FeatherWing MIDI OUT jack
 ```
+
+The board talks over **two transports at once** — USB serial and WiFi — and the
+app lets you connect over either via the **Via:** selector. Lines are mirrored
+to whatever is connected; commands are accepted from both.
 
 ## Setup
 
@@ -41,11 +45,37 @@ pio run --target upload --project-dir MIDI_NOTE_LIGHT_REAL
 
 or VS Code → *Terminal ▸ Run Task… ▸ Upload to Midi Light*.
 
+## Connecting wirelessly (WiFi SoftAP)
+
+The board hosts its own WiFi network — no router needed. Defaults (baked into
+`MIDI_NOTE_LIGHT_REAL/src/main.cpp`, change them there):
+
+| | |
+|---|---|
+| SSID | `MIDI-Recorder` |
+| Password | `midi1234` |
+| Board IP | `192.168.4.1` |
+| TCP port | `5000` |
+
+1. On the PC, **join the `MIDI-Recorder` WiFi network** (you'll lose your normal
+   internet while joined — that's expected for SoftAP).
+2. In the app set **Via: WiFi (TCP)**, leave host/port at `192.168.4.1:5000`,
+   click **Connect**.
+
+> **Timing note:** over WiFi, recording stays sample-faithful because takes are
+> timestamped with the *board's* clock (the `ms` in each `EVT` line), not host
+> arrival time — so network jitter doesn't smear your recording. Playback is
+> host-timed and will have a little jitter over WiFi (fine for monitoring).
+
+To use a cable instead, set **Via: USB Serial** and pick the COM port. USB is
+always available even while WiFi is up.
+
 ## Using it
 
-1. **Connect** – pick the board's COM port and click *Connect*. The status dot
-   goes green when the board's `READY` banner arrives. Click **PING** any time
-   to confirm the round-trip (you'll see a `PONG … (link OK)` line).
+1. **Connect** – choose the transport (**Via:**), pick the COM port or WiFi
+   host, and click *Connect*. The status dot goes green when the board's
+   `READY` banner arrives. Click **PING** any time to confirm the round-trip
+   (you'll see a `PONG … (link OK)` line).
 2. **Watch** – incoming notes scroll in the console and appear in the *Active
    notes* list while held. The heartbeat (`in/out/err` counters, top-right)
    updates every 2 s.
@@ -82,7 +112,7 @@ Board → PC:
 READY <name> <version>
 #<free text>
 EVT <ms> <TYPE> <ch> <d1> <d2>      TYPE: NON NOF CC PB PC AT CAT
-STAT <ms> in=<n> out=<n> err=<n>
+STAT <ms> in=<n> out=<n> err=<n> net=<0|1>   net=1 when a TCP client is connected
 PONG <ms>
 ECHO <text>
 ```
