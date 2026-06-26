@@ -1,416 +1,258 @@
 /*
-  MIDI Note Flash – ESP32-S3 / Seeed XIAO ESP32-S3
+  MIDI Note Recorder Bridge – ESP32-S3 / Seeed XIAO ESP32-S3
+  (branch: midi_rec_for_recording)
 
-  Watches a serial MIDI input for Note On messages. Every time a Note On
-  arrives (on channel 1, with non-zero velocity), the relay pulses on for a
-  short period, then turns back off. The matrix does not pulse: it shows an
-  'M' identity banner at startup and then a dim green power dot at rest.
+  On this branch the board does NOTHING with lights, the relay, or ESP-NOW.
+  It is a dumb, fast MIDI <-> USB bridge for the companion tkinter recorder UI
+  (MIDI_RECORDER_UI/midi_recorder.py):
 
-  Hardware:
-    - Seeed XIAO ESP32-S3
-    - 8x8 WS2812 / NeoPixel matrix on MATRIX_PIN
-    - Relay module on RELAY_PIN (mirrors the receiver board): relay IN -> RELAY_PIN,
-      relay COM/NO -> the light + its supply. Pulsed on for the duration of each flash.
-    - MIDI input (e.g. MIDI FeatherWing) wired to the UART used by Serial1
+    HARDWARE MIDI IN  (FeatherWing, Serial1) ── parsed ──▶ USB Serial lines ──▶ PC
+    PC ──▶ USB Serial commands ── emitted ──▶ HARDWARE MIDI OUT (FeatherWing, Serial1)
 
-  MIDI plumbing follows the Adafruit MIDI FeatherWing note player example.
+  The PC side does the recording (host clock) and timed playback; the firmware
+  just translates between the 31250-baud DIN MIDI world and a simple, line-based
+  ASCII protocol over the 115200-baud USB serial link. Keeping it line-based
+  means you can also just open the PlatformIO serial monitor and read/debug it
+  by hand.
+
+  ---- Lines the board SENDS to the PC (newline-terminated) -----------------
+    READY <fwName> <version>            once, at the end of setup()
+    #<text>                             human-readable info / banner (ignored by parser)
+    EVT <ms> <TYPE> <ch> <d1> <d2>      one MIDI event. TYPE in:
+                                          NON NOF CC PB PC AT CAT  (see typeName())
+                                        ms = board millis() when received.
+    STAT <ms> in=<n> out=<n> err=<n>    periodic heartbeat / counters
+    PONG <ms>                           reply to a PING
+    ECHO <text>                         reply to an ECHO command (link test)
+
+  ---- Lines the board ACCEPTS from the PC (for playback / testing) ----------
+    PING                                -> PONG
+    ECHO <text>                         -> ECHO <text>
+    STAT                                -> emit a STAT line now
+    PNON <ch> <note> <vel>              send Note On out the MIDI OUT jack
+    PNOF <ch> <note> <vel>              send Note Off out the MIDI OUT jack
+    PCC  <ch> <num> <val>               send Control Change
+    PPB  <ch> <value14>                 send Pitch Bend (0..16383, 8192=center)
+    PPC  <ch> <prog>                    send Program Change
+    ALLOFF [ch]                         All Notes Off (CC123) on ch, or all chans
+    RAW <hexbyte> [hexbyte ...]         emit arbitrary raw bytes out MIDI OUT
+
+  Channels in the protocol are 1..16 (human MIDI numbering).
 */
 
 #include <Arduino.h>
 #include <MIDI.h>
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_NeoMatrix.h>
-#include <Adafruit_NeoPixel.h>
+// -------- IDENTITY --------
+#define FW_NAME    "midi-recorder-bridge"
+#define FW_VERSION "1.0"
 
-#include <WiFi.h>
-#include <esp_now.h>
-
-// -------- MIDI INPUT --------
-// The MIDI FeatherWing uses the hardware UART at 31250 baud. We put MIDI on
-// Serial1 so it stays off the USB Serial used for programming/debug. The XIAO
-// ESP32-S3 has native USB, so the UART pins are free (this is the "native USB
-// works fine" case in the Adafruit MIDI FeatherWing docs).
-//
-// These are the XIAO ESP32-S3's silkscreened UART pins:
+// -------- HARDWARE MIDI (FeatherWing on Serial1) --------
+// XIAO ESP32-S3 silkscreened UART pins:
 //   D7 = GPIO44 = RX  (wire to the wing's TX / MIDI IN)
-//   D6 = GPIO43 = TX  (wire to the wing's RX; unused for input-only)
+//   D6 = GPIO43 = TX  (wire to the wing's RX / MIDI OUT)
 #define MIDI_RX_PIN 44
 #define MIDI_TX_PIN 43
 
 HardwareSerial MidiSerial(1);
 MIDI_CREATE_INSTANCE(HardwareSerial, MidiSerial, MIDI);
 
-// -------- RAW DEBUG MODE --------
-// Set to 1 to BYPASS the MIDI parser and print every raw byte arriving on the
-// UART. Use this first to confirm anything is reaching the board at all — the
-// MIDI library silently drops bytes it doesn't recognize as valid MIDI, so if
-// wiring/baud is wrong you'd see nothing in normal mode. Set back to 0 once
-// you've confirmed bytes are flowing.
-#define RAW_MIDI_DUMP 0
+// -------- COUNTERS (exposed in STAT) --------
+unsigned long inCount  = 0;   // MIDI events received from the wire and forwarded
+unsigned long outCount = 0;   // MIDI events emitted from PC commands
+unsigned long errCount = 0;   // malformed PC commands
 
-// -------- LED MATRIX --------
-// Matches the sender/receiver boards: 8x8, data on GPIO 14.
-#define MATRIX_PIN    14
-#define MATRIX_WIDTH  8
-#define MATRIX_HEIGHT 8
-
-Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
-  MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_PIN,
-  NEO_MATRIX_TOP + NEO_MATRIX_LEFT +
-  NEO_MATRIX_ROWS + NEO_MATRIX_PROGRESSIVE,
-  NEO_RGB + NEO_KHZ800
-);
-
-// -------- RELAY / LIGHT --------
-// A relay is driven in lockstep with the matrix flash, mirroring the receiver
-// board: the relay closes on a Note On (channel 1) and reopens when the flash
-// duration elapses. Relay is on/off only, so velocity scales the matrix
-// brightness/duration but not the relay (it just follows the flash window).
-#define RELAY_PIN         2     // GPIO driving the relay IN pin (D1 on the XIAO)
-#define RELAY_ACTIVE_HIGH true  // true: HIGH = relay ON. Set false for active-low modules.
-
-void relayWrite(bool on) {
-  digitalWrite(RELAY_PIN, (on == RELAY_ACTIVE_HIGH) ? HIGH : LOW);
+// Short token for each MIDI message type. Keep in sync with the parser in
+// midi_recorder.py.
+const char *typeName(midi::MidiType t) {
+  switch (t) {
+    case midi::NoteOn:               return "NON";
+    case midi::NoteOff:              return "NOF";
+    case midi::ControlChange:        return "CC";
+    case midi::PitchBend:            return "PB";
+    case midi::ProgramChange:        return "PC";
+    case midi::AfterTouchPoly:       return "AT";   // d1=note d2=pressure
+    case midi::AfterTouchChannel:    return "CAT";  // d1=pressure
+    default:                         return "OTH";
+  }
 }
 
-// -------- FLASH SCALING (by velocity) --------
-// MIDI velocity (1..127) is mapped onto two output ranges — brightness and
-// duration — each shaped by a curve exponent:
-//   curve = 1.0  -> linear
-//   curve > 1.0  -> ease-in  (soft notes stay dim/short, only hard hits pop)
-//   curve < 1.0  -> ease-out (even soft notes are fairly bright/long)
-// Tune the min/max and curve to taste.
-#define VEL_MIN              1     // input velocity range (MIDI is 1..127)
-#define VEL_MAX            127
-
-#define FLASH_BRIGHT_MIN    150     // matrix brightness at min velocity (0..255)
-#define FLASH_BRIGHT_MAX   255     // matrix brightness at max velocity
-#define FLASH_BRIGHT_CURVE  2.0f   // brightness response curve
-
-#define FLASH_DUR_MIN_MS    40     // flash length at min velocity (ms)
-#define FLASH_DUR_MAX_MS   80     // flash length at max velocity (ms)
-#define FLASH_DUR_CURVE     1.5f   // duration response curve
-
-// -------- FLASH STATE --------
-bool          flashActive    = false;
-unsigned long flashStartMs   = 0;
-unsigned long flashDurationMs = 0;   // set per Note On from velocity
-
-// Map an input through a range with a curve (gamma) shaping. Input is clamped
-// to [inMin, inMax]; output is in [outMin, outMax].
-float mapCurved(float in, float inMin, float inMax,
-                float outMin, float outMax, float curve) {
-  float t = (in - inMin) / (inMax - inMin);
-  if (t < 0.0f) t = 0.0f;
-  if (t > 1.0f) t = 1.0f;
-  t = powf(t, curve);
-  return outMin + t * (outMax - outMin);
-}
-
-// -------- POWER INDICATOR --------
-// A single dim green pixel in the bottom-right corner shows the board is
-// powered/idle. It's the resting state between flashes.
-#define POWER_LED_BRIGHTNESS 40   // dim so it isn't distracting (0..255)
-
-void showPowerIndicator() {
-  matrix.setBrightness(POWER_LED_BRIGHTNESS);
-  matrix.fillScreen(0);
-  // Bottom-right corner pixel.
-  matrix.drawPixel(MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1, matrix.Color(0, 255, 0));
-  matrix.show();
-}
-
-// Show a single identity letter on the matrix for a moment (startup banner).
-// The built-in 5x7 GFX font fits one character in the 8x8 grid.
-void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
-  matrix.setBrightness(120);
-  matrix.fillScreen(0);
-  matrix.setTextWrap(false);
-  matrix.setTextSize(1);
-  matrix.setTextColor(matrix.Color(r, g, b));
-  matrix.setCursor(2, 1);   // roughly center the 5x7 glyph in the 8x8 grid
-  matrix.print(c);
-  matrix.show();
-  delay(holdMs);
-  matrix.fillScreen(0);
-  matrix.show();
-}
-
-// The flash is relay-only — the matrix no longer pulses white. It stays on its
-// resting power dot throughout.
-void flashOn() {
-  relayWrite(true);    // close the relay for the duration of the flash
-}
-
-void flashOff() {
-  relayWrite(false);   // reopen the relay
-}
-
-// -------- ESP-NOW (mirror the flash to the receiver board) --------
-// Broadcast a velocity-scaled flash command so ACCELERATION_LIGHT_RECIEVER
-// flashes its matrix + relay light with the same brightness/duration. Default
-// target is the broadcast address (any receiver on the same WiFi channel).
-uint8_t espNowPeerMac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-bool    espNowReady      = false;
-
-// Must match the receiver's struct byte-for-byte (5 bytes packed).
-typedef struct __attribute__((packed)) {
-  uint8_t  cmd;         // = FLASH_CMD_MAGIC
-  uint8_t  velocity;    // original MIDI velocity 1..127
-  uint8_t  brightness;  // matrix brightness 0..255 (already scaled)
-  uint16_t durationMs;  // flash duration in ms (already scaled)
-} FlashCommand;
-#define FLASH_CMD_MAGIC 0xF1
-
-// Tiny handshake beacon so the receiver's link indicator stays green (it
-// red-blinks the matrix when it hasn't heard a HELLO recently). 1 byte, must
-// match the receiver's HandshakeMessage.
-enum HandshakeType { HS_HELLO = 1, HS_ACK = 2 };
-typedef struct __attribute__((packed)) { uint8_t type; } HandshakeMessage;
-
-const unsigned long HELLO_INTERVAL_MS = 1000;
-unsigned long lastHelloSentMs = 0;
-
-void espNowBegin() {
-  // ESP-NOW rides on the WiFi radio; station mode, not joined to any AP.
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  Serial.print("This board STA MAC: ");
-  Serial.println(WiFi.macAddress());
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init FAILED");
+// Forward one parsed message to the PC as an EVT line. For pitch bend we report
+// the 14-bit value in d1 (d2 left 0) so the PC doesn't have to re-stitch bytes.
+void emitEvent(const midi::Message<128> &msg) {
+  // Skip the high-rate System Real-Time stream (clock / active sensing) so the
+  // recorder isn't flooded; it carries no note content.
+  if (msg.type == midi::Clock || msg.type == midi::ActiveSensing ||
+      msg.type == midi::Start  || msg.type == midi::Continue     ||
+      msg.type == midi::Stop) {
     return;
   }
 
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, espNowPeerMac, 6);
-  peer.channel = 0;       // use the current WiFi channel
-  peer.encrypt = false;
-  if (esp_now_add_peer(&peer) != ESP_OK) {
-    Serial.println("ESP-NOW add peer FAILED");
-    return;
+  int d1 = msg.data1;
+  int d2 = msg.data2;
+  if (msg.type == midi::PitchBend) {
+    // MIDI.h delivers pitch bend already combined in data1/data2 (LSB/MSB).
+    d1 = ((msg.data2 << 7) | msg.data1);  // 0..16383
+    d2 = 0;
   }
 
-  espNowReady = true;
-  Serial.println("ESP-NOW ready (flash commands enabled)");
+  Serial.print("EVT ");
+  Serial.print(millis());      Serial.print(' ');
+  Serial.print(typeName(msg.type)); Serial.print(' ');
+  Serial.print(msg.channel);   Serial.print(' ');
+  Serial.print(d1);            Serial.print(' ');
+  Serial.println(d2);
+  inCount++;
 }
 
-void espNowSendFlash(uint8_t velocity, uint8_t brightness, uint16_t durationMs) {
-  if (!espNowReady) return;
-  FlashCommand fc;
-  fc.cmd        = FLASH_CMD_MAGIC;
-  fc.velocity   = velocity;
-  fc.brightness = brightness;
-  fc.durationMs = durationMs;
-  esp_now_send(espNowPeerMac, (const uint8_t *)&fc, sizeof(fc));
+// -------- STAT heartbeat --------
+#define STAT_INTERVAL_MS 2000
+unsigned long lastStatMs = 0;
+
+void emitStat() {
+  Serial.print("STAT ");
+  Serial.print(millis());
+  Serial.print(" in=");  Serial.print(inCount);
+  Serial.print(" out="); Serial.print(outCount);
+  Serial.print(" err="); Serial.println(errCount);
 }
 
-void espNowSendHello() {
-  if (!espNowReady) return;
-  HandshakeMessage hs;
-  hs.type = HS_HELLO;
-  esp_now_send(espNowPeerMac, (const uint8_t *)&hs, sizeof(hs));
-}
+// =====================================================================
+//  PC command parser (lines arriving on USB Serial)
+// =====================================================================
+char    cmdBuf[96];
+uint8_t cmdLen = 0;
 
-// Running total of Note On messages we've flashed for, for debug context.
-unsigned long noteOnCount = 0;
-
-// Called by the MIDI library for every Note On message.
-void handleNoteOn(byte channel, byte note, byte velocity) {
-  // Only flash for channel 1. MIDI.begin(1) already filters to channel 1, but
-  // guard explicitly so the relay never fires on other channels.
-  if (channel != 1) return;
-
-  // A Note On with velocity 0 is the conventional "note off" — ignore it.
-  if (velocity == 0) {
-    Serial.print("[");      Serial.print(millis());
-    Serial.print(" ms] Note On (vel=0 => note off) ch="); Serial.print(channel);
-    Serial.print(" note="); Serial.println(note);
-    return;
+// Parse up to 4 integer args after the command token. Returns how many parsed.
+int parseArgs(char *p, long *out, int maxArgs) {
+  int n = 0;
+  while (n < maxArgs) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') break;
+    char *end = nullptr;
+    long v = strtol(p, &end, 0);   // base 0 -> also accepts 0x.. for RAW
+    if (end == p) break;           // no number consumed
+    out[n++] = v;
+    p = end;
   }
-
-  // Scale brightness and duration from velocity, each with its own curve.
-  uint8_t       brightness = (uint8_t)mapCurved(velocity, VEL_MIN, VEL_MAX,
-                               FLASH_BRIGHT_MIN, FLASH_BRIGHT_MAX, FLASH_BRIGHT_CURVE);
-  unsigned long duration   = (unsigned long)mapCurved(velocity, VEL_MIN, VEL_MAX,
-                               FLASH_DUR_MIN_MS, FLASH_DUR_MAX_MS, FLASH_DUR_CURVE);
-
-  flashOn();
-  flashActive     = true;
-  flashStartMs    = millis();
-  flashDurationMs = duration;
-  noteOnCount++;
-
-  // Mirror the same scaled flash to the receiver board over ESP-NOW.
-  espNowSendFlash(velocity, brightness, (uint16_t)duration);
-
-  Serial.print("[");        Serial.print(flashStartMs);
-  Serial.print(" ms] Note On  ch=");  Serial.print(channel);
-  Serial.print(" note=");   Serial.print(note);
-  Serial.print(" vel=");    Serial.print(velocity);
-  Serial.print("  -> FLASH ON  bright="); Serial.print(brightness);
-  Serial.print(" dur=");    Serial.print(duration);
-  Serial.print("ms (#");    Serial.print(noteOnCount);
-  Serial.println(")");
+  return n;
 }
 
-// Called for every Note Off message — handy to see the full note lifecycle.
-void handleNoteOff(byte channel, byte note, byte velocity) {
-  Serial.print("[");        Serial.print(millis());
-  Serial.print(" ms] Note Off ch="); Serial.print(channel);
-  Serial.print(" note=");   Serial.print(note);
-  Serial.print(" vel=");    Serial.println(velocity);
+void sendAllOff(int ch) {
+  // CC 123 = All Notes Off.
+  MIDI.sendControlChange(123, 0, ch);
+  outCount++;
 }
 
-// Catch-all for anything that isn't a Note On/Off, so unexpected traffic is
-// visible instead of silently dropped.
-void handleOtherMessage(const midi::Message<128> &msg) {
-  if (msg.type == midi::NoteOn || msg.type == midi::NoteOff) return;
-  // Don't spam the log with the continuous clock / active-sensing stream.
-  if (msg.type == midi::Clock || msg.type == midi::ActiveSensing) return;
-  Serial.print("[");        Serial.print(millis());
-  Serial.print(" ms] MIDI msg type=0x"); Serial.print(msg.type, HEX);
-  Serial.print(" ch=");     Serial.print(msg.channel);
-  Serial.print(" d1=");     Serial.print(msg.data1);
-  Serial.print(" d2=");     Serial.println(msg.data2);
+void handleCommand(char *line) {
+  // Split the leading command token from the rest.
+  char *args = line;
+  while (*args && *args != ' ' && *args != '\t') args++;
+  char saved = *args;
+  *args = '\0';                 // terminate the token
+  const char *cmd = line;
+  char *rest = (saved == '\0') ? args : args + 1;
+
+  long a[4];
+
+  if (strcasecmp(cmd, "PING") == 0) {
+    Serial.print("PONG "); Serial.println(millis());
+
+  } else if (strcasecmp(cmd, "ECHO") == 0) {
+    Serial.print("ECHO "); Serial.println(rest);
+
+  } else if (strcasecmp(cmd, "STAT") == 0) {
+    emitStat();
+
+  } else if (strcasecmp(cmd, "PNON") == 0) {
+    if (parseArgs(rest, a, 3) == 3) { MIDI.sendNoteOn(a[1], a[2], a[0]); outCount++; }
+    else errCount++;
+
+  } else if (strcasecmp(cmd, "PNOF") == 0) {
+    if (parseArgs(rest, a, 3) == 3) { MIDI.sendNoteOff(a[1], a[2], a[0]); outCount++; }
+    else errCount++;
+
+  } else if (strcasecmp(cmd, "PCC") == 0) {
+    if (parseArgs(rest, a, 3) == 3) { MIDI.sendControlChange(a[1], a[2], a[0]); outCount++; }
+    else errCount++;
+
+  } else if (strcasecmp(cmd, "PPB") == 0) {
+    // value 0..16383 (8192 center) -> MIDI.h wants -8192..8191
+    if (parseArgs(rest, a, 2) == 2) { MIDI.sendPitchBend((int)(a[1] - 8192), a[0]); outCount++; }
+    else errCount++;
+
+  } else if (strcasecmp(cmd, "PPC") == 0) {
+    if (parseArgs(rest, a, 2) == 2) { MIDI.sendProgramChange(a[1], a[0]); outCount++; }
+    else errCount++;
+
+  } else if (strcasecmp(cmd, "ALLOFF") == 0) {
+    int n = parseArgs(rest, a, 1);
+    if (n == 1) sendAllOff(a[0]);
+    else for (int ch = 1; ch <= 16; ch++) sendAllOff(ch);
+
+  } else if (strcasecmp(cmd, "RAW") == 0) {
+    long bytes[16];
+    int n = parseArgs(rest, bytes, 16);
+    for (int i = 0; i < n; i++) MidiSerial.write((uint8_t)bytes[i]);
+    if (n > 0) outCount++; else errCount++;
+
+  } else if (cmd[0] == '\0') {
+    // blank line, ignore
+
+  } else {
+    errCount++;
+    Serial.print("# unknown cmd: "); Serial.println(cmd);
+  }
 }
 
+void pumpSerialCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmdBuf[cmdLen] = '\0';
+      handleCommand(cmdBuf);
+      cmdLen = 0;
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    } else {
+      // overflow: reset the line so we don't act on a truncated command
+      cmdLen = 0;
+      errCount++;
+    }
+  }
+}
+
+// =====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(300);
 
-  pinMode(RELAY_PIN, OUTPUT);
-  relayWrite(false);      // light off at boot
-
-  matrix.begin();
-
-  // Startup banner: 'M' identifies this board as the MIDI note light.
-  showStartupLetter('M', 0, 0, 255, 1000);
-
-  showPowerIndicator();   // green corner dot = powered/idle
-
-  // Standard MIDI baud is 31250. Map Serial1 onto the chosen pins.
+  // Hardware DIN MIDI: 31250 baud, 8N1, on the FeatherWing UART pins.
   MidiSerial.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
 
-  espNowBegin();   // WiFi/ESP-NOW radio for mirroring flashes to the receiver
+  // Receive on every channel and hand each message to emitEvent(). Turn OFF
+  // the library's automatic Thru so incoming MIDI isn't blindly echoed back out
+  // (the PC controls MIDI OUT explicitly during playback).
+  MIDI.setHandleMessage(emitEvent);
+  MIDI.begin(MIDI_CHANNEL_OMNI);
+  MIDI.turnThruOff();
 
-#if RAW_MIDI_DUMP
-  Serial.println("=================================================");
-  Serial.println("RAW MIDI DUMP MODE - printing every byte on the UART.");
-  Serial.print  ("  Listening on Serial1 RX=GPIO"); Serial.print(MIDI_RX_PIN);
-  Serial.println(" @ 31250 baud, 8N1");
-  Serial.println("  If you see NOTHING here, no bytes are reaching the pin:");
-  Serial.println("    - check wiring TX(source) -> RX=GPIO44, common GND");
-  Serial.println("    - confirm the source is actually sending");
-  Serial.println("    - try swapping RX/TX, or a different baud");
-  Serial.println("=================================================");
-  return;   // skip MIDI library setup; loop() handles the raw dump
-#endif
-
-  MIDI.setHandleNoteOn(handleNoteOn);
-  MIDI.setHandleNoteOff(handleNoteOff);
-  MIDI.setHandleMessage(handleOtherMessage);   // everything else
-  MIDI.begin(1);   // listen only on MIDI channel 1
-
-  Serial.println("=================================================");
-  Serial.println("MIDI note flash ready - waiting for Note On.");
-  Serial.print  ("  MIDI on Serial1: RX=GPIO"); Serial.print(MIDI_RX_PIN);
-  Serial.print  (" TX=GPIO");                   Serial.print(MIDI_TX_PIN);
-  Serial.println(" @ 31250 baud");
-  Serial.print  ("  Matrix: ");  Serial.print(MATRIX_WIDTH);
-  Serial.print  ("x");           Serial.print(MATRIX_HEIGHT);
-  Serial.print  (" on GPIO");    Serial.print(MATRIX_PIN);
   Serial.println();
-  Serial.print  ("  Flash by velocity: bright ");
-  Serial.print(FLASH_BRIGHT_MIN); Serial.print(".."); Serial.print(FLASH_BRIGHT_MAX);
-  Serial.print  (" (curve "); Serial.print(FLASH_BRIGHT_CURVE); Serial.print(")");
-  Serial.print  (", dur ");
-  Serial.print(FLASH_DUR_MIN_MS); Serial.print(".."); Serial.print(FLASH_DUR_MAX_MS);
-  Serial.print  ("ms (curve "); Serial.print(FLASH_DUR_CURVE); Serial.println(")");
-  Serial.println("=================================================");
+  Serial.print("# "); Serial.print(FW_NAME); Serial.print(' '); Serial.println(FW_VERSION);
+  Serial.print("# MIDI IN/OUT on Serial1 RX=GPIO"); Serial.print(MIDI_RX_PIN);
+  Serial.print(" TX=GPIO"); Serial.print(MIDI_TX_PIN); Serial.println(" @ 31250 8N1");
+  Serial.println("# USB link @ 115200. Send PING for PONG. Recorder UI: MIDI_RECORDER_UI/midi_recorder.py");
+  Serial.print("READY "); Serial.print(FW_NAME); Serial.print(' '); Serial.println(FW_VERSION);
 }
 
-// Heartbeat: prove the board is alive even when no MIDI is arriving.
-#define HEARTBEAT_INTERVAL_MS 5000
-unsigned long lastHeartbeatMs = 0;
-
 void loop() {
-#if RAW_MIDI_DUMP
-  // Dump every raw byte as hex, 16 per line with the timestamp of the first
-  // byte on each line. Flash the matrix briefly on ANY byte so you also get a
-  // visual confirmation without watching the serial monitor.
-  static int  bytesOnLine = 0;
-  while (MidiSerial.available()) {
-    uint8_t b = MidiSerial.read();
+  MIDI.read();            // parse hardware MIDI -> emitEvent() -> EVT lines
+  pumpSerialCommands();   // PC commands -> MIDI OUT / replies
 
-    // Skip System Real-Time spam so real messages are visible:
-    //   0xF8 Timing Clock, 0xFE Active Sensing. (Keep Start/Stop/Continue
-    //   0xFA/0xFB/0xFC and everything else.)
-    if (b == 0xF8 || b == 0xFE) continue;
-
-    if (bytesOnLine == 0) {
-      Serial.print("[");  Serial.print(millis());  Serial.print(" ms] RX:");
-    }
-    Serial.print(" ");
-    if (b < 0x10) Serial.print("0");   // pad to two hex digits
-    Serial.print(b, HEX);
-
-    if (++bytesOnLine >= 16) { Serial.println(); bytesOnLine = 0; }
-
-    // Flash only on a Note On status byte (0x90-0x9F) so the matrix isn't
-    // pinned on by continuous traffic. (Raw mode can't see velocity here, so
-    // it uses a fixed full-brightness blip.)
-    if ((b & 0xF0) == 0x90) {
-      flashOn();
-      flashActive     = true;
-      flashStartMs    = millis();
-      flashDurationMs = FLASH_DUR_MIN_MS;
-    }
-  }
-
-  // Turn the flash off after the duration (same non-blocking logic as below).
-  if (flashActive && (millis() - flashStartMs >= flashDurationMs)) {
-    flashActive = false;
-    flashOff();
-  }
-
-  // Heartbeat so an idle line is obvious vs. a hung board.
-  unsigned long nowRaw = millis();
-  if (nowRaw - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-    lastHeartbeatMs = nowRaw;
-    if (bytesOnLine > 0) { Serial.println(); bytesOnLine = 0; }  // flush partial line
-    Serial.print("["); Serial.print(nowRaw);
-    Serial.println(" ms] (raw dump) no bytes / idle");
-  }
-  return;
-#endif
-
-  // Pump the MIDI parser; fires the handlers on incoming messages.
-  MIDI.read();
-
-  // Beacon HELLO so the receiver's link indicator stays green between notes.
-  if (millis() - lastHelloSentMs >= HELLO_INTERVAL_MS) {
-    lastHelloSentMs = millis();
-    espNowSendHello();
-  }
-
-  // Non-blocking: turn the matrix back off once the flash duration elapses.
-  if (flashActive && (millis() - flashStartMs >= flashDurationMs)) {
-    flashActive = false;
-    flashOff();
-    Serial.print("["); Serial.print(millis());
-    Serial.println(" ms] FLASH OFF");
-  }
-
-  // Periodic alive ping with a running count of notes seen so far.
   unsigned long now = millis();
-  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-    lastHeartbeatMs = now;
-    Serial.print("["); Serial.print(now);
-    Serial.print(" ms] alive - noteOns="); Serial.print(noteOnCount);
-    Serial.print(" flashActive=");          Serial.println(flashActive ? "yes" : "no");
+  if (now - lastStatMs >= STAT_INTERVAL_MS) {
+    lastStatMs = now;
+    emitStat();
   }
 }

@@ -53,6 +53,14 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Run MIDI Recorder UI",
+      "type": "shell",
+      "command": "python",
+      "args": ["${workspaceFolder}/MIDI_RECORDER_UI/midi_recorder.py"],
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Quick Commit & Push",
       "type": "shell",
       "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
