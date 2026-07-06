@@ -1,1 +1,2 @@
 pyserial>=3.5
+python-rtmidi>=1.5   # optional: lets playback go to a system MIDI output instead of the ESP32

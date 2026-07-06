@@ -11,13 +11,17 @@ simple ASCII lines, and accepts playback commands back. This app:
   * shows a live connection status + heartbeat (in/out/err counters),
   * shows incoming notes as they arrive (event monitor + active-note display),
   * RECORDS incoming events with a host-side clock,
-  * PLAYS BACK a recording by streaming timed commands to the board, which
-    emits them out the FeatherWing MIDI OUT jack,
+  * PLAYS BACK a recording either by streaming timed commands to the board
+    (emitted out the FeatherWing MIDI OUT jack) or, if python-rtmidi is
+    installed, straight to a system MIDI output port (e.g. an
+    iConnectMIDI2+), picked in the "Playback Output" panel,
   * SAVES / LOADS recordings as JSON, and exports a Standard MIDI File (.mid),
   * has a raw console + debug toggles (PING test, show heartbeats, show raw,
     send manual commands) so you can see exactly what the link is doing.
 
 Dependencies:  pyserial   (pip install pyserial)
+               python-rtmidi (optional; pip install python-rtmidi) for the
+               direct-to-system-MIDI-output playback path.
 tkinter ships with CPython on Windows/macOS and most Linux python3 packages.
 
 Protocol (must match MIDI_NOTE_LIGHT_REAL/src/main.cpp):
@@ -28,12 +32,13 @@ Protocol (must match MIDI_NOTE_LIGHT_REAL/src/main.cpp):
 import json
 import os
 import queue
+import re
 import socket
 import struct
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 try:
     import serial
@@ -43,6 +48,12 @@ except ImportError:  # pragma: no cover - import guard for a friendlier message
         "pyserial is required.  Install it with:  pip install pyserial"
     )
 
+try:
+    import rtmidi  # python-rtmidi: lets playback go straight to a system MIDI
+                    # output (e.g. an iConnectMIDI2+) instead of the ESP32.
+except ImportError:
+    rtmidi = None
+
 BAUD = 115200
 # SoftAP defaults baked into the firmware (MIDI_NOTE_LIGHT_REAL/src/main.cpp).
 WIFI_SSID = "MIDI-Recorder"
@@ -50,6 +61,27 @@ WIFI_PASS = "midi1234"
 WIFI_HOST = "192.168.4.1"   # board's SoftAP IP
 WIFI_PORT = 5000
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# MIDI event types the board can emit (EVT lines), in display order.
+# Only Program Change is visible/recorded by default; the rest must be
+# opted into via the "Event Filters" panel.
+EVENT_TYPES = [
+    ("NON", "Note On"),
+    ("NOF", "Note Off"),
+    ("CC", "Ctrl Change"),
+    ("PC", "Prog Change"),
+    ("PB", "Pitch Bend"),
+    ("AT", "Aftertouch"),
+    ("CAT", "Chan Pressure"),
+]
+DEFAULT_VISIBLE_TYPES = {"PC"}
+
+# Named recordings ("songs") are persisted as one JSON file per song here.
+SONGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "songs")
+
+# Playback destination options: the ESP32's hardware MIDI OUT jack, or (if
+# python-rtmidi is installed) a real system MIDI output port picked by name.
+ESP32_OUTPUT_LABEL = "ESP32 (board MIDI OUT)"
 
 
 def note_name(note: int) -> str:
@@ -191,6 +223,33 @@ class TcpLink:
 
 
 # =====================================================================
+#  Raw MIDI byte encoding, shared by the SMF exporter and live playback
+#  (both ESP32-command and direct-system-MIDI-output paths).
+# =====================================================================
+def midi_bytes(etype: str, ch: int, d1: int, d2: int) -> "bytes | None":
+    """Encode one recorded event as status+data bytes (channel 1..16 -> 0..15).
+    Returns None for event types with no raw-MIDI equivalent."""
+    c = max(0, min(15, int(ch) - 1))
+    d1, d2 = int(d1), int(d2)
+    if etype == "NON":
+        return bytes([0x90 | c, d1 & 0x7F, d2 & 0x7F])
+    if etype == "NOF":
+        return bytes([0x80 | c, d1 & 0x7F, d2 & 0x7F])
+    if etype == "CC":
+        return bytes([0xB0 | c, d1 & 0x7F, d2 & 0x7F])
+    if etype == "PC":
+        return bytes([0xC0 | c, d1 & 0x7F])
+    if etype == "PB":
+        val = max(0, min(16383, d1))
+        return bytes([0xE0 | c, val & 0x7F, (val >> 7) & 0x7F])
+    if etype == "CAT":
+        return bytes([0xD0 | c, d1 & 0x7F])
+    if etype == "AT":
+        return bytes([0xA0 | c, d1 & 0x7F, d2 & 0x7F])
+    return None
+
+
+# =====================================================================
 #  Standard MIDI File export (no external deps).
 # =====================================================================
 def _vlq(value: int) -> bytes:
@@ -218,25 +277,8 @@ def export_smf(path: str, events: list, ppq: int = 480, bpm: float = 120.0):
         tick = int(round(ev["t"] / seconds_per_tick))
         delta = max(0, tick - last_tick)
         last_tick = tick
-        ch = max(0, min(15, int(ev["ch"]) - 1))  # protocol is 1..16 -> 0..15
-        t = ev["type"]
-        d1, d2 = int(ev["d1"]), int(ev["d2"])
-        if t == "NON":
-            msg = bytes([0x90 | ch, d1 & 0x7F, d2 & 0x7F])
-        elif t == "NOF":
-            msg = bytes([0x80 | ch, d1 & 0x7F, d2 & 0x7F])
-        elif t == "CC":
-            msg = bytes([0xB0 | ch, d1 & 0x7F, d2 & 0x7F])
-        elif t == "PC":
-            msg = bytes([0xC0 | ch, d1 & 0x7F])
-        elif t == "PB":
-            val = max(0, min(16383, d1))
-            msg = bytes([0xE0 | ch, val & 0x7F, (val >> 7) & 0x7F])
-        elif t == "CAT":
-            msg = bytes([0xD0 | ch, d1 & 0x7F])
-        elif t == "AT":
-            msg = bytes([0xA0 | ch, d1 & 0x7F, d2 & 0x7F])
-        else:
+        msg = midi_bytes(ev["type"], ev["ch"], ev["d1"], ev["d2"])
+        if msg is None:
             continue
         track += _vlq(delta) + msg
 
@@ -245,6 +287,80 @@ def export_smf(path: str, events: list, ppq: int = 480, bpm: float = 120.0):
     with open(path, "wb") as fh:
         fh.write(b"MThd" + struct.pack(">IHHH", 6, 0, 1, ppq))
         fh.write(b"MTrk" + struct.pack(">I", len(track)) + bytes(track))
+
+
+# =====================================================================
+#  Timeline: a horizontal strip showing where Program Change events land
+#  in the current take, plus a playhead that tracks recording/playback.
+# =====================================================================
+class TimelineView:
+    MARGIN = 10
+
+    def __init__(self, parent, height: int = 90):
+        self.canvas = tk.Canvas(parent, height=height, background="#181c22",
+                                 highlightthickness=0)
+        self.events: list = []
+        self.duration = 1.0
+        self.playhead_t = 0.0
+        self.canvas.bind("<Configure>", lambda e: self._redraw_static())
+
+    def set_events(self, events: list):
+        self.events = events
+        self.duration = max(1.0, max((e["t"] for e in events), default=0.0))
+        self._redraw_static()
+
+    def set_playhead(self, t: float):
+        self.playhead_t = max(0.0, t)
+        if self.playhead_t > self.duration:
+            self.duration = self.playhead_t
+            self._redraw_static()
+        else:
+            self._redraw_playhead()
+
+    def _x_of(self, t: float) -> float:
+        w = max(1, self.canvas.winfo_width() - 2 * self.MARGIN)
+        return self.MARGIN + (t / self.duration) * w
+
+    def _redraw_static(self):
+        c = self.canvas
+        c.delete("static")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1:
+            return
+        baseline_y = h - 22
+        c.create_line(self.MARGIN, baseline_y, w - self.MARGIN, baseline_y,
+                      fill="#3a4250", tags="static")
+        step = self._nice_step(self.duration)
+        t = 0.0
+        while t <= self.duration + 1e-9:
+            x = self._x_of(t)
+            c.create_line(x, baseline_y - 4, x, baseline_y + 4, fill="#3a4250", tags="static")
+            c.create_text(x, baseline_y + 12, text=f"{t:g}s", fill="#7b8494",
+                          font=("Consolas", 8), tags="static")
+            t += step
+        for ev in self.events:
+            if ev.get("type") != "PC":
+                continue
+            x = self._x_of(ev["t"])
+            c.create_line(x, 8, x, baseline_y, fill="#ffcb6b", tags="static")
+            c.create_text(x, 6, text=str(ev["d1"]), fill="#ffcb6b", anchor="n",
+                          font=("Consolas", 9, "bold"), tags="static")
+        self._redraw_playhead()
+
+    def _redraw_playhead(self):
+        c = self.canvas
+        c.delete("playhead")
+        h = c.winfo_height()
+        x = self._x_of(self.playhead_t)
+        c.create_line(x, 0, x, h, fill="#ff6b6b", width=2, tags="playhead")
+
+    @staticmethod
+    def _nice_step(duration: float) -> float:
+        raw = duration / 8
+        for step in (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300):
+            if raw <= step:
+                return step
+        return 600.0
 
 
 # =====================================================================
@@ -271,15 +387,52 @@ class RecorderApp:
         self.events: list = []          # captured events (current take)
         self.active_notes: dict = {}    # (ch, note) -> velocity, for live display
 
+        # song state: a "song" is a named take persisted to SONGS_DIR. Record
+        # writes into whichever song is currently selected.
+        self.current_song: "str | None" = None
+
         # playback state
         self.playing = False
         self._play_thread: "threading.Thread | None" = None
         self._play_stop = threading.Event()
+        self._play_t0: "float | None" = None    # time.monotonic() at playback start
+        self._play_speed = 1.0                  # speed captured at playback start
+        self._play_dest = ESP32_OUTPUT_LABEL    # plain-str snapshot of playback_dest
+                                                 # (the _play_loop thread must never
+                                                 # touch a Tk Var directly)
+
+        # playback destination: the ESP32's own MIDI OUT jack, or (via
+        # python-rtmidi) a real system MIDI output port, e.g. an
+        # iConnectMIDI2+. Independent of the ESP32 connection used for
+        # recording / the MIDI OUT wiring test below.
+        self.playback_dest = tk.StringVar(value=ESP32_OUTPUT_LABEL)
+        self.midiout = None   # open rtmidi.MidiOut, or None when using the ESP32
+
+        # multi-track record: replays the current song for a set number of
+        # passes, prompting between passes so hardware can be reconfigured.
+        self.multitrack_active = False
+        self.multitrack_pass = 0
+        self.multitrack_total = 4
+
+        # MIDI-out test toggle: pulses a fixed note (ch1 C4) to confirm the
+        # hardware MIDI OUT wiring is working, independent of any recording.
+        self.testing_midi = False
+        self._test_thread: "threading.Thread | None" = None
+        self._test_stop = threading.Event()
+        self._test_interval = 0.5   # interval captured at test start (seconds)
 
         # debug toggles
         self.show_raw = tk.BooleanVar(value=False)
         self.show_heartbeat = tk.BooleanVar(value=False)
         self.autoscroll = tk.BooleanVar(value=True)
+
+        # per-event-type filters: whether each MIDI message type shows up in
+        # the console log and/or gets captured into a recording. Only
+        # Program Change is on by default.
+        self.log_filter = {code: tk.BooleanVar(value=(code in DEFAULT_VISIBLE_TYPES))
+                            for code, _ in EVENT_TYPES}
+        self.rec_filter = {code: tk.BooleanVar(value=(code in DEFAULT_VISIBLE_TYPES))
+                            for code, _ in EVENT_TYPES}
 
         # link health
         self.last_rx_time = 0.0
@@ -288,8 +441,15 @@ class RecorderApp:
 
         self._build_ui()
         self.refresh_ports()
+        self.refresh_songs()
+        if rtmidi is None:
+            self.log("python-rtmidi not installed - playback can still go through the "
+                      "ESP32; run `pip install python-rtmidi` to send it straight to a "
+                      "system MIDI output (e.g. an iConnectMIDI2+).", "sys")
+        self.refresh_playback_ports()
         self.root.after(self.POLL_MS, self._drain_queue)
         self.root.after(500, self._tick_status)
+        self.root.after(50, self._tick_timeline)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------------- UI construction ----------------
@@ -343,12 +503,42 @@ class RecorderApp:
             text=f"WiFi: join SSID \"{WIFI_SSID}\" (pass \"{WIFI_PASS}\"), then Connect to {WIFI_HOST}:{WIFI_PORT}")
         self._update_transport_fields()
 
+        # ---- Timeline: PC-change layout + playhead for the current song ----
+        tl_frame = ttk.LabelFrame(self.root, text="Timeline — Program Changes")
+        tl_frame.pack(fill="x", **pad)
+        self.timeline = TimelineView(tl_frame)
+        self.timeline.canvas.pack(fill="x", expand=True, padx=4, pady=4)
+
         # ---- Main split: left = transport + active notes, right = console ----
         body = ttk.Frame(self.root)
         body.pack(fill="both", expand=True, **pad)
 
         left = ttk.Frame(body)
         left.pack(side="left", fill="y")
+
+        # Song select — Record writes into whichever song is picked here.
+        song = ttk.LabelFrame(left, text="Song")
+        song.pack(fill="x", pady=(0, 6))
+        ttk.Label(song, text="Current:").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.song_cb = ttk.Combobox(song, state="readonly", width=16)
+        self.song_cb.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        self.song_cb.bind("<<ComboboxSelected>>", lambda e: self.select_song(self.song_cb.get()))
+        ttk.Button(song, text="New…", command=self.new_song_dialog).grid(row=0, column=2, padx=4, pady=4)
+        song.columnconfigure(1, weight=1)
+
+        # Playback destination — where Play/panic actually send events.
+        # Independent of the connection above, which is only needed for
+        # recording, the ESP32 output option, and the MIDI OUT wiring test.
+        outp = ttk.LabelFrame(left, text="Playback Output")
+        outp.pack(fill="x", pady=(0, 6))
+        ttk.Label(outp, text="Send to:").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.playback_cb = ttk.Combobox(outp, state="readonly", width=16,
+                                        textvariable=self.playback_dest)
+        self.playback_cb.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        self.playback_cb.bind("<<ComboboxSelected>>", lambda e: self._on_playback_dest_change())
+        ttk.Button(outp, text="Refresh", command=self.refresh_playback_ports).grid(
+            row=0, column=2, padx=4, pady=4)
+        outp.columnconfigure(1, weight=1)
 
         # Transport / recording
         rec = ttk.LabelFrame(left, text="Recorder")
@@ -374,6 +564,33 @@ class RecorderApp:
         ttk.Button(fbtns, text="Load…", command=self.load_json).pack(side="left", padx=2)
         ttk.Button(fbtns, text="Export .mid", command=self.export_mid).pack(side="left", padx=2)
 
+        # MIDI-out wiring test: pulses ch1 C4 at a set interval so hardware
+        # MIDI OUT (and anything wired off it, e.g. the relay) can be confirmed.
+        testf = ttk.Frame(rec)
+        testf.grid(row=5, column=0, columnspan=2, pady=(2, 4), sticky="ew")
+        self.test_btn = ttk.Button(testf, text="TEST MIDI OUT", command=self.toggle_test_midi)
+        self.test_btn.pack(side="left", padx=2)
+        ttk.Label(testf, text="every").pack(side="left", padx=(8, 2))
+        self.test_interval_var = tk.DoubleVar(value=0.5)
+        ttk.Spinbox(testf, from_=0.1, to=5.0, increment=0.1, width=5,
+                    textvariable=self.test_interval_var).pack(side="left")
+        ttk.Label(testf, text="s").pack(side="left", padx=(2, 0))
+
+        # Multi-track record: replay the same song N times in a row so a
+        # limited number of hardware inputs (e.g. capturing an Octatrack's 8
+        # tracks 2 at a time) can be recorded across multiple passes.
+        mt = ttk.LabelFrame(left, text="Multi-Track Record")
+        mt.pack(fill="x", pady=(0, 6))
+        self.multitrack_btn = ttk.Button(mt, text="Start Multi-Track", command=self.toggle_multitrack)
+        self.multitrack_btn.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        ttk.Label(mt, text="Passes:").grid(row=0, column=1, padx=(8, 2), pady=4, sticky="e")
+        self.multitrack_passes_var = tk.IntVar(value=4)
+        ttk.Spinbox(mt, from_=1, to=16, width=4,
+                    textvariable=self.multitrack_passes_var).grid(row=0, column=2, padx=(0, 4), pady=4)
+        self.multitrack_status = ttk.Label(mt, text="idle")
+        self.multitrack_status.grid(row=1, column=0, columnspan=3, padx=4, pady=(0, 4), sticky="w")
+        mt.columnconfigure(0, weight=1)
+
         # Active notes display
         an = ttk.LabelFrame(left, text="Active notes")
         an.pack(fill="both", expand=True)
@@ -391,6 +608,26 @@ class RecorderApp:
         ttk.Checkbutton(dbg, text="Show heartbeats", variable=self.show_heartbeat).pack(side="left", padx=6)
         ttk.Checkbutton(dbg, text="Auto-scroll", variable=self.autoscroll).pack(side="left", padx=6)
         ttk.Button(dbg, text="Clear log", command=self.clear_log).pack(side="right", padx=6)
+
+        # ---- Per-type event filters (log visibility / recording inclusion) ----
+        filt = ttk.LabelFrame(right, text="Event Filters")
+        filt.pack(fill="x", pady=(6, 0))
+        ttk.Label(filt, text="Log").grid(row=1, column=0, padx=4, sticky="e")
+        ttk.Label(filt, text="Rec").grid(row=2, column=0, padx=4, sticky="e")
+        for col, (code, _label) in enumerate(EVENT_TYPES, start=1):
+            ttk.Label(filt, text=code).grid(row=0, column=col, padx=4, pady=(2, 0))
+            ttk.Checkbutton(filt, variable=self.log_filter[code]).grid(row=1, column=col, padx=4)
+            ttk.Checkbutton(filt, variable=self.rec_filter[code]).grid(row=2, column=col, padx=4)
+
+        # Block specific PC program numbers outright (not logged, not recorded)
+        # regardless of the Log/Rec checkboxes above — for noisy/junk PC values
+        # a controller sends that you never want to see at all.
+        ttk.Label(filt, text="Block PC #:").grid(row=3, column=0, padx=4, pady=(6, 4), sticky="e")
+        self.pc_block_var = tk.StringVar(value="")
+        ttk.Entry(filt, textvariable=self.pc_block_var, width=20).grid(
+            row=3, column=1, columnspan=len(EVENT_TYPES) - 1, padx=4, pady=(6, 4), sticky="w")
+        ttk.Label(filt, text="e.g. 127", foreground="#777").grid(
+            row=3, column=len(EVENT_TYPES), padx=4, pady=(6, 4), sticky="w")
 
         consf = ttk.LabelFrame(right, text="Console")
         consf.pack(fill="both", expand=True, pady=(6, 0))
@@ -567,30 +804,67 @@ class RecorderApp:
         except ValueError:
             return
 
+        if etype == "PC" and d1 in self._blocked_pc_values():
+            return   # fully ignored: not logged, not recorded
+
         # Record using the BOARD's timestamp (the ms field), not host arrival
         # time, so WiFi/USB latency and jitter don't smear the captured timing.
-        if self.recording:
+        # Gated per-type: only event types with "Rec" checked are captured, so
+        # the anchor is only set on the first *recorded* event, not the first
+        # event of any kind.
+        rec_var = self.rec_filter.get(etype)
+        if self.recording and rec_var is not None and rec_var.get():
             if self.rec_start_ms is None:
-                self.rec_start_ms = ms          # anchor on the first event
+                self.rec_start_ms = ms          # anchor on the first recorded event
             self.events.append({
                 "t": max(0.0, (ms - self.rec_start_ms) / 1000.0),
                 "ms": ms, "type": etype, "ch": ch, "d1": d1, "d2": d2,
             })
             self.rec_status.config(text=f"● REC — {len(self.events)} events")
 
-        # Live active-note tracking.
+        # Live active-note tracking (independent of the log/record filters —
+        # this is a real-time performance monitor, not a log).
         if etype == "NON" and d2 > 0:
             self.active_notes[(ch, d1)] = d2
         elif etype == "NOF" or (etype == "NON" and d2 == 0):
             self.active_notes.pop((ch, d1), None)
         self._refresh_active()
 
-        # Console line (human readable).
-        if etype in ("NON", "NOF"):
-            human = f"ch{ch:<2} {note_name(d1):>4} ({d1:>3}) vel={d2:<3}"
-            self.log(f"{etype}  {human}", "evt")
+        # Console line (human readable), gated per-type by the "Log" filter.
+        log_var = self.log_filter.get(etype)
+        if log_var is not None and log_var.get():
+            self.log(self._format_event(etype, ch, d1, d2), "evt")
         elif self.show_raw.get():
             self.log(line, "evt")
+
+    def _format_event(self, etype: str, ch: int, d1: int, d2: int) -> str:
+        """Human-readable rendering of one MIDI event for the console."""
+        if etype in ("NON", "NOF"):
+            return f"{etype}  ch{ch:<2} {note_name(d1):>4} ({d1:>3}) vel={d2:<3}"
+        if etype == "CC":
+            return f"CC   ch{ch:<2} ctrl={d1:<3} val={d2:<3}"
+        if etype == "PC":
+            return f"PC   ch{ch:<2} prog={d1:<3}"
+        if etype == "PB":
+            return f"PB   ch{ch:<2} bend={d1:<5} (0..16383)"
+        if etype == "AT":
+            return f"AT   ch{ch:<2} {note_name(d1):>4} ({d1:>3}) press={d2}"
+        if etype == "CAT":
+            return f"CAT  ch{ch:<2} press={d1}"
+        return f"{etype}  ch{ch} d1={d1} d2={d2}"
+
+    def _blocked_pc_values(self) -> set:
+        """Program-Change numbers to fully ignore, from the "Block PC #:" field
+        (comma/space-separated, e.g. "127" or "0, 127")."""
+        out = set()
+        for tok in re.split(r"[,\s]+", self.pc_block_var.get().strip()):
+            if not tok:
+                continue
+            try:
+                out.add(int(tok))
+            except ValueError:
+                pass
+        return out
 
     def _handle_stat(self, line: str):
         for part in line.split():
@@ -609,31 +883,170 @@ class RecorderApp:
         for (ch, note), vel in sorted(self.active_notes.items()):
             self.active_list.insert(tk.END, f"ch{ch:<2} {note_name(note):>4} ({note:>3}) vel={vel}")
 
+    # ---------------- Playback output ----------------
+    def refresh_playback_ports(self):
+        ports = [ESP32_OUTPUT_LABEL]
+        if rtmidi is not None:
+            try:
+                ports += rtmidi.MidiOut().get_ports()
+            except Exception as exc:
+                self.log(f"MIDI output scan failed: {exc}", "err")
+        self.playback_cb["values"] = ports
+        if self.playback_dest.get() not in ports:
+            self.playback_dest.set(ESP32_OUTPUT_LABEL)
+            self._on_playback_dest_change()
+        return ports
+
+    def _on_playback_dest_change(self):
+        dest = self.playback_dest.get()
+        self._close_midiout()
+        if dest == ESP32_OUTPUT_LABEL or rtmidi is None:
+            self.log(f"Playback output -> {ESP32_OUTPUT_LABEL}.", "sys")
+            return
+        try:
+            names = rtmidi.MidiOut().get_ports()
+            out = rtmidi.MidiOut()
+            out.open_port(names.index(dest))
+            self.midiout = out
+            self.log(f"Playback output -> \"{dest}\".", "sys")
+        except Exception as exc:
+            messagebox.showerror("MIDI output failed", f"Couldn't open \"{dest}\":\n{exc}")
+            self.log(f"Failed to open MIDI output \"{dest}\": {exc}", "err")
+            self.playback_dest.set(ESP32_OUTPUT_LABEL)
+
+    def _close_midiout(self):
+        if self.midiout is not None:
+            try:
+                self.midiout.close_port()
+            except Exception:
+                pass
+            self.midiout = None
+
+    def _require_playback_ready(self) -> bool:
+        if self.playback_dest.get() == ESP32_OUTPUT_LABEL:
+            return self._require_link()
+        if self.midiout is None:
+            messagebox.showwarning("No MIDI output", "Select a MIDI output port first.")
+            return False
+        return True
+
+    def _all_notes_off_playback(self, dest: "str | None" = None):
+        # dest lets the background playback thread pass its plain-str snapshot
+        # instead of touching the playback_dest Tk Var from off the main thread.
+        if dest is None:
+            dest = self.playback_dest.get()
+        if dest == ESP32_OUTPUT_LABEL:
+            if self.link.is_open:
+                self.link.write_line("ALLOFF")
+        elif self.midiout is not None:
+            for ch in range(16):
+                self.midiout.send_message([0xB0 | ch, 123, 0])
+
+    # ---------------- Songs ----------------
+    def _song_path(self, name: str) -> str:
+        return os.path.join(SONGS_DIR, f"{name}.json")
+
+    def _sanitize_song_name(self, name: str) -> str:
+        name = name.strip()
+        return re.sub(r'[\\/:*?"<>|]', "", name)
+
+    def _write_song(self, name: str, events: list):
+        os.makedirs(SONGS_DIR, exist_ok=True)
+        with open(self._song_path(name), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "events": events}, fh, indent=2)
+
+    def refresh_songs(self):
+        os.makedirs(SONGS_DIR, exist_ok=True)
+        names = sorted(os.path.splitext(f)[0] for f in os.listdir(SONGS_DIR)
+                        if f.lower().endswith(".json"))
+        self.song_cb["values"] = names
+        return names
+
+    def new_song_dialog(self):
+        if self.recording:
+            messagebox.showinfo("Recording", "Stop recording first.")
+            return
+        name = simpledialog.askstring("New song", "Song name:", parent=self.root)
+        if not name:
+            return
+        name = self._sanitize_song_name(name)
+        if not name:
+            messagebox.showwarning("Invalid name", "Song name can't be empty.")
+            return
+        if os.path.exists(self._song_path(name)) and not messagebox.askyesno(
+                "Overwrite song?",
+                f"A song named \"{name}\" already exists. Overwrite it with a new, empty song?"):
+            return
+        self._write_song(name, [])
+        self.refresh_songs()
+        self.select_song(name)
+        self.log(f"Created song \"{name}\".", "sys")
+
+    def select_song(self, name: str):
+        if not name:
+            return
+        if self.recording:
+            messagebox.showinfo("Recording", "Stop recording before switching songs.")
+            self.song_cb.set(self.current_song or "")
+            return
+        try:
+            with open(self._song_path(name), "r", encoding="utf-8") as fh:
+                events = json.load(fh)["events"]
+        except FileNotFoundError:
+            events = []
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+        self.current_song = name
+        self.events = events
+        self.song_cb.set(name)
+        self.rec_status.config(text=f"idle — \"{name}\" — {len(self.events)} events")
+        self.timeline.set_events(self.events)
+        self.timeline.set_playhead(0.0)
+        self.log(f"Loaded song \"{name}\" ({len(self.events)} events).", "sys")
+
     # ---------------- Recording ----------------
     def toggle_record(self):
         if self.recording:
             self.recording = False
             self.record_btn.config(text="● Record")
-            self.rec_status.config(text=f"stopped — {len(self.events)} events")
-            self.log(f"Recording stopped: {len(self.events)} events.", "sys")
+            if self.current_song:
+                self._write_song(self.current_song, self.events)
+                self.rec_status.config(text=f"stopped — \"{self.current_song}\" — {len(self.events)} events")
+                self.log(f"Recording stopped: saved {len(self.events)} events to \"{self.current_song}\".", "sys")
+            else:
+                self.rec_status.config(text=f"stopped — {len(self.events)} events")
+                self.log(f"Recording stopped: {len(self.events)} events.", "sys")
+            self.timeline.set_events(self.events)
         else:
+            if not self.current_song:
+                messagebox.showwarning("No song selected", "Select or create a song first.")
+                return
             if self.events and not messagebox.askyesno(
-                    "Overwrite take?",
-                    f"Discard the current {len(self.events)}-event take and record fresh?"):
+                    "Overwrite song?",
+                    f"Recording will overwrite the {len(self.events)}-event take saved in "
+                    f"\"{self.current_song}\". Continue?"):
                 return
             self.events = []
             self.recording = True
             self.rec_start_ms = None   # anchored on the first event's board ms
             self.record_btn.config(text="■ Stop Rec")
-            self.rec_status.config(text="● REC — 0 events")
-            self.log("Recording started.", "sys")
+            self.rec_status.config(text=f"● REC — \"{self.current_song}\" — 0 events")
+            self.timeline.set_events([])
+            self.timeline.set_playhead(0.0)
+            self.log(f"Recording started into \"{self.current_song}\".", "sys")
 
     def clear_take(self):
         if self.recording:
             messagebox.showinfo("Recording", "Stop recording first.")
             return
         self.events = []
-        self.rec_status.config(text="idle — 0 events")
+        self.timeline.set_events(self.events)
+        self.timeline.set_playhead(0.0)
+        if self.current_song:
+            self.rec_status.config(text=f"idle — \"{self.current_song}\" — 0 events")
+        else:
+            self.rec_status.config(text="idle — 0 events")
         self.log("Take cleared.", "sys")
 
     # ---------------- Playback ----------------
@@ -644,9 +1057,16 @@ class RecorderApp:
         if not self.events:
             messagebox.showinfo("Nothing to play", "Record or load a take first.")
             return
-        if not self._require_link():
+        if not self._require_playback_ready():
             return
+        self._start_playback()
+
+    def _start_playback(self):
         self.playing = True
+        self._play_speed = max(0.05, self.speed.get())
+        self._play_dest = self.playback_dest.get()
+        self._play_t0 = time.monotonic()
+        self.timeline.set_playhead(0.0)
         self.play_btn.config(text="■ Stop")
         self._play_stop.clear()
         self._play_thread = threading.Thread(target=self._play_loop, daemon=True)
@@ -654,9 +1074,9 @@ class RecorderApp:
         self.log(f"Playback started ({len(self.events)} events, x{self.speed.get()}).", "sys")
 
     def _play_loop(self):
-        speed = max(0.05, self.speed.get())
+        speed = self._play_speed
         events = sorted(self.events, key=lambda e: e["t"])
-        t0 = time.monotonic()
+        t0 = self._play_t0
         for ev in events:
             if self._play_stop.is_set():
                 break
@@ -670,11 +1090,20 @@ class RecorderApp:
                 break
             self._send_event(ev)
         # leave nothing hanging
-        self.link.write_line("ALLOFF")
+        stopped_early = self._play_stop.is_set()
+        self._all_notes_off_playback(self._play_dest)
         self.line_queue.put(("line", "# playback finished"))
-        self.root.after(0, self._play_done)
+        self.root.after(0, self._play_done, stopped_early)
 
     def _send_event(self, ev: dict):
+        # Runs on the background playback thread: use the plain-str snapshot
+        # (self._play_dest), never self.playback_dest.get() (a Tk Var).
+        if self._play_dest != ESP32_OUTPUT_LABEL:
+            if self.midiout is not None:
+                msg = midi_bytes(ev["type"], ev["ch"], ev["d1"], ev["d2"])
+                if msg is not None:
+                    self.midiout.send_message(list(msg))
+            return
         t, ch, d1, d2 = ev["type"], ev["ch"], ev["d1"], ev["d2"]
         if t == "NON":
             self.link.write_line(f"PNON {ch} {d1} {d2}")
@@ -687,17 +1116,109 @@ class RecorderApp:
         elif t == "PC":
             self.link.write_line(f"PPC {ch} {d1}")
 
-    def _play_done(self):
+    def _play_done(self, stopped_early: bool = False):
         self.playing = False
+        self._play_t0 = None
         self.play_btn.config(text="▶ Play")
+        self.timeline.set_playhead(0.0)
         self.log("Playback stopped.", "sys")
+        if self.multitrack_active:
+            if stopped_early:
+                self._cancel_multitrack("Multi-track cancelled: playback stopped early.")
+            else:
+                self._multitrack_advance()
 
     def panic(self):
-        if self._require_link():
-            self.link.write_line("ALLOFF")
+        if self._require_playback_ready():
+            self._all_notes_off_playback()
             self.active_notes.clear()
             self._refresh_active()
             self.log("ALLOFF (panic) sent.", "tx")
+
+    # ---------------- Multi-track record ----------------
+    def toggle_multitrack(self):
+        if self.multitrack_active:
+            self._play_stop.set()   # _play_done() will see this and cancel cleanly
+            self._cancel_multitrack("Multi-track cancelled.")
+            return
+        if self.playing:
+            messagebox.showinfo("Playback in progress", "Stop playback first.")
+            return
+        if not self.events:
+            messagebox.showinfo("Nothing to play", "Record or load a take first.")
+            return
+        if not self._require_playback_ready():
+            return
+        self.multitrack_total = max(1, int(self.multitrack_passes_var.get()))
+        self.multitrack_pass = 1
+        self.multitrack_active = True
+        self.multitrack_btn.config(text="■ Stop Multi-Track")
+        self.multitrack_status.config(text=f"Multi-track: pass {self.multitrack_pass}/{self.multitrack_total}")
+        self.log(f"Multi-track: starting pass {self.multitrack_pass}/{self.multitrack_total}.", "sys")
+        self._start_playback()
+
+    def _multitrack_advance(self):
+        completed = self.multitrack_pass
+        if completed >= self.multitrack_total:
+            self.multitrack_active = False
+            self.multitrack_btn.config(text="Start Multi-Track")
+            self.multitrack_status.config(text=f"Multi-track complete ({self.multitrack_total}/{self.multitrack_total}).")
+            self.log("Multi-track recording complete.", "sys")
+            messagebox.showinfo("Multi-track complete",
+                                 f"All {self.multitrack_total} passes finished.")
+            return
+        self.multitrack_pass += 1
+        proceed = messagebox.askokcancel(
+            "Ready for next set of tracks",
+            f"Pass {completed} of {self.multitrack_total} finished.\n\n"
+            f"Reconfigure the Octatrack outputs / your recorder inputs for the "
+            f"next set of tracks, then click OK to start pass "
+            f"{self.multitrack_pass} of {self.multitrack_total}.")
+        if not proceed:
+            self._cancel_multitrack(f"Multi-track cancelled after pass {completed}/{self.multitrack_total}.")
+            return
+        self.multitrack_status.config(text=f"Multi-track: pass {self.multitrack_pass}/{self.multitrack_total}")
+        self.log(f"Multi-track: starting pass {self.multitrack_pass}/{self.multitrack_total}.", "sys")
+        self._start_playback()
+
+    def _cancel_multitrack(self, message: str):
+        self.multitrack_active = False
+        self.multitrack_btn.config(text="Start Multi-Track")
+        self.multitrack_status.config(text=message)
+        self.log(message, "sys")
+
+    # ---------------- MIDI-out wiring test ----------------
+    def toggle_test_midi(self):
+        if self.testing_midi:
+            self._test_stop.set()
+            return
+        if not self._require_link():
+            return
+        self.testing_midi = True
+        self._test_interval = max(0.05, self.test_interval_var.get())
+        self._test_stop.clear()
+        self.test_btn.config(text="■ Stop Test")
+        self._test_thread = threading.Thread(target=self._test_loop, daemon=True)
+        self._test_thread.start()
+        self.log(f"TEST MIDI OUT started (ch1 note C4 every {self._test_interval:g}s).", "sys")
+
+    def _test_loop(self):
+        ch, note, vel = 1, 60, 100
+        on_time = min(0.1, self._test_interval / 2)
+        while not self._test_stop.is_set():
+            self.link.write_line(f"PNON {ch} {note} {vel}")
+            if self._test_stop.wait(on_time):
+                break
+            self.link.write_line(f"PNOF {ch} {note} 0")
+            if self._test_stop.wait(self._test_interval - on_time):
+                break
+        self.link.write_line(f"PNOF {ch} {note} 0")   # don't leave a stuck note
+        self.root.after(0, self._test_done)
+
+    def _test_done(self):
+        self.testing_midi = False
+        self.test_btn.config(text="TEST MIDI OUT")
+        self.log("TEST MIDI OUT stopped.", "sys")
 
     # ---------------- Save / load / export ----------------
     def save_json(self):
@@ -725,6 +1246,8 @@ class RecorderApp:
             messagebox.showerror("Load failed", str(exc))
             return
         self.rec_status.config(text=f"loaded — {len(self.events)} events")
+        self.timeline.set_events(self.events)
+        self.timeline.set_playhead(0.0)
         self.log(f"Loaded {len(self.events)} events <- {os.path.basename(path)}", "sys")
 
     def export_mid(self):
@@ -787,13 +1310,33 @@ class RecorderApp:
                 self.set_status(True)
         self.root.after(500, self._tick_status)
 
+    def _tick_timeline(self):
+        # Drives the playhead: continuous during playback (elapsed wall time
+        # x speed), or snapped to the latest event while recording. Polling
+        # here (instead of redrawing per-event) caps redraw rate regardless
+        # of how fast MIDI events stream in.
+        if self.playing and self._play_t0 is not None:
+            elapsed = (time.monotonic() - self._play_t0) * self._play_speed
+            self.timeline.set_playhead(elapsed)
+        elif self.recording:
+            self.timeline.set_events(self.events)
+            if self.events:
+                self.timeline.set_playhead(self.events[-1]["t"])
+        self.root.after(50, self._tick_timeline)
+
     def on_close(self):
         self._play_stop.set()
+        self._test_stop.set()
         try:
             if self.link.is_open:
                 self.link.write_line("ALLOFF")
         except Exception:
             pass
+        try:
+            self._all_notes_off_playback()
+        except Exception:
+            pass
+        self._close_midiout()
         self.link.close()
         self.root.destroy()
 
