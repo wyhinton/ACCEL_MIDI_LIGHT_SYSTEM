@@ -17,7 +17,9 @@
 
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <ESP8266WiFi.h>
 #include <SoftwareSerial.h>
+#include <WiFiUdp.h>
 
 #include "effects.h"
 
@@ -40,6 +42,9 @@
 //   m    calibrate the physical light order: each channel lights alone in
 //        turn and you type the lit lamp's position 1-7; once all seven are
 //        assigned the map is saved to EEPROM flash ('m' mid-run aborts)
+//   o/l  raise/lower the audio depth: how strongly the PC audio level
+//        stream (see the audio section below and AUDIO_LEVEL_BRIDGE/) dims
+//        the lights -- 10% per press, 0 = ignore audio, 100 = follow it fully
 //   Effects noise (see updateEffectNoise()) -- how deeply the per-channel
 //   wandering noise randomizes the effect, each its own 0-100% depth:
 //   a/z  raise/lower the brightness depth (lit channels shimmer dimmer)
@@ -141,6 +146,109 @@ void updateLinkStatus() {
   }
 }
 
+// ---- PC audio level stream ------------------------------------------------
+// A helper script on the PC (see AUDIO_LEVEL_BRIDGE/) measures how loud the
+// audio going to a Windows output device is and streams it here as
+// [0xAD sync][level 0-255] frames -- interleaved with the key commands on the
+// USB serial (0xAD can't collide with any typed key), and/or wirelessly as
+// UDP packets to the SoftAP below. The level acts as a master brightness
+// scale multiplied into every mode's output (chase, effects, test-all, the
+// extender's channels included) at the point of write. audioDepthPct sets
+// how strongly: the scale interpolates between full brightness (depth 0%)
+// and the raw audio level (depth 100%). The stream is entirely optional --
+// after AUDIO_TIMEOUT_MS without a frame the scale snaps back to full, so
+// the board behaves exactly as before whenever the script isn't running.
+// [0xAE sync][percent] frames set audioDepthPct remotely (the script's
+// --depth flag); 'o'/'l' adjust it 10% per press at the terminal.
+static const uint8_t AUDIO_LEVEL_SYNC_BYTE = 0xAD;
+static const uint8_t AUDIO_DEPTH_SYNC_BYTE = 0xAE;
+static const unsigned long AUDIO_TIMEOUT_MS = 1000;
+static uint8_t audioLevel = 255;
+static uint8_t audioDepthPct = 100;
+static bool audioActive = false;
+static unsigned long lastAudioRxMillis = 0;
+static uint8_t lastAppliedAudioScale = 255; // see updateAudio()
+
+// SoftAP the PC joins to send frames without the USB cable (which also
+// leaves the COM port free for a plain serial terminal). UDP rather than
+// TCP because the stream is fire-and-forget: a lost packet just means the
+// next one, ~16ms later, lands instead -- no reconnect logic to get stuck.
+// Note WiFi interrupts can jitter the 9600-baud SoftwareSerial link a
+// little; the sync-byte framing and the content-free heartbeat both
+// tolerate an occasional mangled byte.
+static const char *AUDIO_AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
+static const uint16_t AUDIO_UDP_PORT = 7777;
+WiFiUDP audioUdp;
+
+void onAudioLevel(uint8_t level) {
+  audioLevel = level;
+  lastAudioRxMillis = millis();
+  if (!audioActive) {
+    audioActive = true;
+    Serial.printf("[AUDIO] level stream active (depth %u%%, 'o'/'l' adjusts)\n",
+                  (unsigned)audioDepthPct);
+  }
+}
+
+void onAudioDepth(uint8_t pct) {
+  if (pct > 100) {
+    pct = 100;
+  }
+  if (pct != audioDepthPct) { // the script re-sends every second; log changes only
+    audioDepthPct = pct;
+    Serial.printf("AUDIO_DEPTH_PCT = %u%% (set by stream)\n", (unsigned)pct);
+  }
+}
+
+void handleAudioFrame(uint8_t sync, uint8_t value) {
+  if (sync == AUDIO_LEVEL_SYNC_BYTE) {
+    onAudioLevel(value);
+  } else {
+    onAudioDepth(value);
+  }
+}
+
+// The master brightness scale right now, 0-255 (255 = no dimming).
+uint8_t audioScale255() {
+  if (!audioActive || audioDepthPct == 0) {
+    return 255;
+  }
+  return (uint8_t)(255 - (uint16_t)(255 - audioLevel) * audioDepthPct / 100);
+}
+
+uint16_t scaleDuty(uint16_t duty) {
+  return (uint16_t)((uint32_t)duty * audioScale255() / 255);
+}
+
+void setupAudioWifi() {
+  WiFi.persistent(false); // don't re-burn the same AP config to flash every boot
+  WiFi.mode(WIFI_AP);
+  bool apUp = WiFi.softAP(AUDIO_AP_SSID); // no password = open AP
+  audioUdp.begin(AUDIO_UDP_PORT);
+  if (apUp) {
+    Serial.printf("[AUDIO] SoftAP '%s' (open) up -- level frames to %s:%u/udp\n",
+                  AUDIO_AP_SSID, WiFi.softAPIP().toString().c_str(),
+                  (unsigned)AUDIO_UDP_PORT);
+  } else {
+    Serial.println("[AUDIO] SoftAP failed to start -- audio frames via USB serial only");
+  }
+}
+
+// A packet may carry several frames (or trailing garbage), so scan for sync
+// bytes rather than trusting alignment -- same spirit as the extender link.
+void pollAudioUdp() {
+  while (audioUdp.parsePacket() > 0) {
+    uint8_t buf[64];
+    int len = audioUdp.read(buf, sizeof(buf));
+    for (int i = 0; i + 1 < len; i++) {
+      if (buf[i] == AUDIO_LEVEL_SYNC_BYTE || buf[i] == AUDIO_DEPTH_SYNC_BYTE) {
+        handleAudioFrame(buf[i], buf[i + 1]);
+        i++;
+      }
+    }
+  }
+}
+
 // Onboard ESP-12E LED (D4), active-LOW. Flashes rapidly for 1s on bootup,
 // then stays lit for the rest of runtime as a power/alive indicator.
 static const uint8_t STATUS_LED_PIN = 2;
@@ -173,8 +281,10 @@ static bool activeLow = false;
 static const int PWM_MAX = 1023;
 
 void setMosfet(uint8_t pin, bool on) {
-  bool level = activeLow ? !on : on;
-  analogWrite(pin, level ? PWM_MAX : 0);
+  // "on" is scaled by the audio master level (a mid-range duty is fine --
+  // it's just PWM); updateAudio() re-drives lit pins as the level moves.
+  uint16_t duty = on ? scaleDuty(PWM_MAX) : 0;
+  analogWrite(pin, activeLow ? PWM_MAX - duty : duty);
 }
 
 // Press '2' to toggle between the chase instantly switching each relay and
@@ -213,11 +323,14 @@ void updateFade() {
   }
   unsigned long elapsed = millis() - fadeStartMillis;
   if (elapsed >= fadeDurationMs) {
-    analogWrite(fadingPin, activeLow ? 0 : PWM_MAX);
+    uint16_t full = scaleDuty(PWM_MAX); // "full" under the audio master scale
+    analogWrite(fadingPin, activeLow ? PWM_MAX - full : full);
     fadingPin = 255;
     return;
   }
-  int duty = (int)((uint32_t)elapsed * PWM_MAX / fadeDurationMs);
+  // Scaling inside the every-tick ramp means a mid-fade lamp follows the
+  // audio level live, not just at the fade's endpoints.
+  int duty = (int)scaleDuty((uint16_t)((uint32_t)elapsed * PWM_MAX / fadeDurationMs));
   analogWrite(fadingPin, activeLow ? (PWM_MAX - duty) : duty);
 }
 
@@ -252,7 +365,13 @@ void applyLocalPin(uint8_t pin, bool on) {
 // waiting out whatever's mid-fade.
 static bool blackout = false;
 
+// The chase channel currently lit (0-6 as in effects mode, 255 = none), so
+// updateAudio() can keep re-driving a lamp that's statically on while the
+// audio level moves. Set by applyChaseStep(), cleared by applyBlackout().
+static uint8_t chaseLitChannel = 255;
+
 void applyBlackout() {
+  chaseLitChannel = 255;
   applyLocalPin(MOSFET_PIN_C, false);
   applyLocalPin(MOSFET_PIN_A, false);
   applyLocalPin(MOSFET_PIN_B, false);
@@ -278,12 +397,13 @@ void sendLinkBrightness(int duty) {
 
 void applyTestAll() {
   fadingPin = 255; // direct duty writes below; don't let a stale fade fight them
-  int level = activeLow ? PWM_MAX - testBrightness : testBrightness;
+  int scaled = (int)scaleDuty((uint16_t)testBrightness);
+  int level = activeLow ? PWM_MAX - scaled : scaled;
   analogWrite(MOSFET_PIN_C, level);
   analogWrite(MOSFET_PIN_A, level);
   analogWrite(MOSFET_PIN_B, level);
   analogWrite(MOSFET_PIN_D, level);
-  sendLinkBrightness(testBrightness);
+  sendLinkBrightness(scaled);
 }
 
 void adjustTestBrightness(int delta) {
@@ -418,7 +538,10 @@ static uint8_t calibrateAssign[EFFECT_CHANNELS];
 
 void calibrateDrive(uint8_t channel, bool on) {
   if (channel < 4) {
-    setMosfet(EFFECT_LOCAL_PINS[channel], on); // instant on purpose; ignores fadeMode
+    // Instant and at full duty on purpose -- ignores fadeMode and the audio
+    // master scale so the one lit lamp is unmistakable even mid-song.
+    bool level = activeLow ? !on : on;
+    analogWrite(EFFECT_LOCAL_PINS[channel], level ? PWM_MAX : 0);
   } else {
     sendLinkCommand(channel - 4, on, false);
   }
@@ -665,6 +788,9 @@ void updateEffectFades() {
       uint32_t nv = effectNoise(i);
       out = (uint16_t)((uint32_t)out * (25500 - nv * noiseBrightnessPct) / 25500);
     }
+    // Audio master scale last, so a moving level re-triggers the
+    // change-detected writes below on its own -- no extra plumbing needed.
+    out = scaleDuty(out);
     if (i < 4) {
       if (out != lastLocalOut[i]) {
         analogWrite(EFFECT_LOCAL_PINS[i], activeLow ? PWM_MAX - out : out);
@@ -749,6 +875,7 @@ void adjustChaseStep(long deltaMs) {
 }
 
 void applyChaseStep(uint8_t step) {
+  chaseLitChannel = channelAtPosition(step);
   for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
     bool on = channelPosition[ch] == step;
     if (ch < 4) {
@@ -771,8 +898,22 @@ void applyChaseStep(uint8_t step) {
 // any other unrecognized byte is echoed back with its hex code so a
 // terminal sending something unexpected is visible instead of silent.
 void handleSerial() {
+  // Audio frames ([0xAD][level] / [0xAE][depth], see the audio section)
+  // interleave with the key commands on the same port. A sync byte parks
+  // here until its value byte arrives -- possibly on a later loop pass.
+  static uint8_t pendingAudioSync = 0;
   while (Serial.available()) {
-    char c = Serial.read();
+    uint8_t b = (uint8_t)Serial.read();
+    if (pendingAudioSync != 0) {
+      handleAudioFrame(pendingAudioSync, b);
+      pendingAudioSync = 0;
+      continue;
+    }
+    if (b == AUDIO_LEVEL_SYNC_BYTE || b == AUDIO_DEPTH_SYNC_BYTE) {
+      pendingAudioSync = b;
+      continue;
+    }
+    char c = (char)b;
     if (calibrateMode) {
       handleCalibrateKey(c); // swallows every key so digits stay calibration input
       continue;
@@ -840,6 +981,10 @@ void handleSerial() {
       adjustNoisePeriod((long)NOISE_PERIOD_STEP_MS);
     } else if (c == 'v') {
       adjustNoisePeriod(-(long)NOISE_PERIOD_STEP_MS);
+    } else if (c == 'o') {
+      adjustNoisePct(&audioDepthPct, NOISE_PCT_STEP, "AUDIO_DEPTH_PCT"); // same clamp-and-print
+    } else if (c == 'l') {
+      adjustNoisePct(&audioDepthPct, -NOISE_PCT_STEP, "AUDIO_DEPTH_PCT");
     } else if (c == ']') {
       adjustChaseStep((long)CHASE_STEP_STEP_MS);
     } else if (c == '[') {
@@ -903,16 +1048,71 @@ void handleSerial() {
   }
 }
 
-// Same as delay(), but keeps polling serial, the link status, and any
-// in-progress fade so they all stay responsive within ~10ms instead of
-// waiting out the rest of the chase step.
+// Times out the audio stream (that's the whole "optional" contract: no
+// frames for AUDIO_TIMEOUT_MS and the scale snaps back to full brightness)
+// and, whenever the master scale moved, re-drives whatever is statically
+// lit so it follows the music instead of freezing at the level it was
+// switched on with. Effects mode needs no help: updateEffectFades()
+// recomputes every channel each tick and its change-detected writes fire on
+// their own. Extender refreshes ride the 0xAC duty frame and share the
+// effects engine's 30ms throttle; while they stream, they override the
+// extender's own on/off fade (the chase's fadeMode bit) -- acceptable,
+// since the audio level is the livelier signal.
+void updateAudio() {
+  if (audioActive && millis() - lastAudioRxMillis >= AUDIO_TIMEOUT_MS) {
+    audioActive = false; // audioScale255() falls back to full below
+    Serial.println("[AUDIO] level stream lost -- restoring full brightness");
+  }
+  uint8_t scale = audioScale255();
+  if (scale == lastAppliedAudioScale) {
+    return;
+  }
+  if (effectsMode || blackout || calibrateMode) {
+    lastAppliedAudioScale = scale; // nothing statically lit that needs re-driving
+    return;
+  }
+  if (testAllMode) {
+    if (millis() - lastLinkDutyMillis < LINK_DUTY_INTERVAL_MS) {
+      return; // applyTestAll() sends a link frame; retry next tick
+    }
+    lastAppliedAudioScale = scale;
+    applyTestAll();
+    lastLinkDutyMillis = millis();
+    return;
+  }
+  if (chaseLitChannel == 255) {
+    lastAppliedAudioScale = scale;
+    return;
+  }
+  if (chaseLitChannel < 4) {
+    uint8_t pin = EFFECT_LOCAL_PINS[chaseLitChannel];
+    if (fadingPin != pin) { // mid-fade, updateFade() already scales every tick
+      uint16_t duty = scaleDuty(PWM_MAX);
+      analogWrite(pin, activeLow ? PWM_MAX - duty : duty);
+    }
+    lastAppliedAudioScale = scale;
+  } else {
+    if (millis() - lastLinkDutyMillis < LINK_DUTY_INTERVAL_MS) {
+      return;
+    }
+    lastAppliedAudioScale = scale;
+    sendLinkChannelDuty(chaseLitChannel - 4, scale); // scale == scaled full in 8-bit
+    lastLinkDutyMillis = millis();
+  }
+}
+
+// Same as delay(), but keeps polling serial, the audio stream, the link
+// status, and any in-progress fade so they all stay responsive within ~10ms
+// instead of waiting out the rest of the chase step.
 void delayWithSerial(unsigned long ms) {
   unsigned long start = millis();
   do {
     handleSerial();
+    pollAudioUdp();
     updateLinkStatus();
     updateFade();
     updateEffectFades();
+    updateAudio();
     delay(10);
   } while (millis() - start < ms);
 }
@@ -930,6 +1130,8 @@ void setup() {
   Serial.println("(10% per press, 0 = off), 'f'/'v' noise period (100ms per press).");
   Serial.println("'m' to calibrate the physical light order (each channel lights alone; type its");
   Serial.println("position 1-7; the order is saved to EEPROM and survives reboots).");
+  Serial.println("'o'/'l' to raise/lower the audio depth (how much the PC audio level stream");
+  Serial.println("dims the lights, 10% per press; see AUDIO_LEVEL_BRIDGE/ for the PC script).");
 
   // Seed the effects noise from the hardware RNG so each boot wanders
   // differently -- Arduino random() is otherwise deterministic.
@@ -940,6 +1142,8 @@ void setup() {
 
   EEPROM.begin(MAP_EEPROM_SIZE);
   loadChannelMap();
+
+  setupAudioWifi();
 
   linkSerial.begin(LINK_BAUD);
   linkStateSinceMillis = millis();
