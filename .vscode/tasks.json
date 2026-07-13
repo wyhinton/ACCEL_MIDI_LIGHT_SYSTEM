@@ -49,6 +49,29 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Run Light Chase UI",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": { "cwd": "${workspaceFolder}/LIGHT_CHASE_UI" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "light-chase-ui",
+        "pattern": {
+          "regexp": "^ERROR$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "VITE v",
+          "endsPattern": "ready in"
+        }
+      },
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Quick Commit & Push",
       "type": "shell",
       "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",

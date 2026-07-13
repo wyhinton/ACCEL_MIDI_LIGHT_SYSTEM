@@ -3,36 +3,8 @@
     {
       "name": "Default",
       "files": [
-        "MIDI_NOTE_LIGHT_REAL/src/main.cpp",
-        ".vscode/tasks.json",
-        "ACCELERATION_LIGHT_SENDER_REAL/.gitignore",
-        "ACCELERATION_LIGHT_SENDER_REAL/.vscode/changelists.json",
-        "ACCELERATION_LIGHT_SENDER_REAL/.vscode/extensions.json",
-        "ACCELERATION_LIGHT_SENDER_REAL/include/README",
-        "ACCELERATION_LIGHT_SENDER_REAL/lib/README",
-        "ACCELERATION_LIGHT_SENDER_REAL/platformio.ini",
-        "ACCELERATION_LIGHT_SENDER_REAL/src/main.cpp",
-        "ACCELERATION_LIGHT_SENDER_REAL/test/README",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/.gitignore",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/.vscode/changelists.json",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/.vscode/extensions.json",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/README.md",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/include/README",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/lib/README",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/platformio.ini",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/src/main.cpp",
-        "ACCLERATION_LIGHT_RECIEVER_REAL/test/README",
-        "MIDI_NOTE_LIGHT_REAL/.gitignore",
-        "MIDI_NOTE_LIGHT_REAL/.vscode/extensions.json",
-        "MIDI_NOTE_LIGHT_REAL/platformio.ini",
-        "MIDI_RECORDER_UI/.gitignore",
-        "MIDI_RECORDER_UI/README.md",
-        "MIDI_RECORDER_UI/midi_recorder.py",
-        "MIDI_RECORDER_UI/requirements.txt",
-        "MULTIPLEX_8266/.gitignore",
-        "MULTIPLEX_8266/platformio.ini",
         "MULTIPLEX_8266/src/main.cpp",
-        ".vscode/changelists.json"
+        "MOSFET_EXTENDER_8266/src/main.cpp"
       ]
     }
   ],
