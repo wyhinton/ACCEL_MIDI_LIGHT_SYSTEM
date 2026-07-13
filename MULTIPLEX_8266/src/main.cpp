@@ -45,6 +45,9 @@
 //   o/l  raise/lower the audio depth: how strongly the PC audio level
 //        stream (see the audio section below and AUDIO_LEVEL_BRIDGE/) dims
 //        the lights -- 10% per press, 0 = ignore audio, 100 = follow it fully
+//   g    toggle the MIDI note flash (on by default): [0xAF][velocity] frames
+//        from the MIDI_NOTE_LIGHT_REAL board flash every channel at a
+//        velocity-scaled brightness/duration, overlaid on the running mode
 //   Effects noise (see updateEffectNoise()) -- how deeply the per-channel
 //   wandering noise randomizes the effect, each its own 0-100% depth:
 //   a/z  raise/lower the brightness depth (lit channels shimmer dimmer)
@@ -162,6 +165,13 @@ void updateLinkStatus() {
 // --depth flag); 'o'/'l' adjust it 10% per press at the terminal.
 static const uint8_t AUDIO_LEVEL_SYNC_BYTE = 0xAD;
 static const uint8_t AUDIO_DEPTH_SYNC_BYTE = 0xAE;
+
+// [0xAF sync][velocity 1-127] frames ride the same two transports (UDP to
+// the SoftAP, or interleaved on the USB serial): one per MIDI Note On, sent
+// by the MIDI_NOTE_LIGHT_REAL board. See the MIDI note flash section below.
+static const uint8_t MIDI_FLASH_SYNC_BYTE = 0xAF;
+void onMidiFlash(uint8_t velocity);  // defined with the rest of that section
+static bool midiFlashActive = false; // declared here so every writer can check it
 static const unsigned long AUDIO_TIMEOUT_MS = 1000;
 static uint8_t audioLevel = 255;
 static uint8_t audioDepthPct = 100;
@@ -203,8 +213,10 @@ void onAudioDepth(uint8_t pct) {
 void handleAudioFrame(uint8_t sync, uint8_t value) {
   if (sync == AUDIO_LEVEL_SYNC_BYTE) {
     onAudioLevel(value);
-  } else {
+  } else if (sync == AUDIO_DEPTH_SYNC_BYTE) {
     onAudioDepth(value);
+  } else {
+    onMidiFlash(value);
   }
 }
 
@@ -241,7 +253,8 @@ void pollAudioUdp() {
     uint8_t buf[64];
     int len = audioUdp.read(buf, sizeof(buf));
     for (int i = 0; i + 1 < len; i++) {
-      if (buf[i] == AUDIO_LEVEL_SYNC_BYTE || buf[i] == AUDIO_DEPTH_SYNC_BYTE) {
+      if (buf[i] == AUDIO_LEVEL_SYNC_BYTE || buf[i] == AUDIO_DEPTH_SYNC_BYTE ||
+          buf[i] == MIDI_FLASH_SYNC_BYTE) {
         handleAudioFrame(buf[i], buf[i + 1]);
         i++;
       }
@@ -763,7 +776,11 @@ void setEffectTarget(uint8_t channel, uint16_t target) {
 }
 
 void updateEffectFades() {
-  if (!effectsMode) {
+  // Also idles while a MIDI flash overlay owns the pins -- applyEffectFrame()
+  // calls in here directly on frame advance, so the gate in delayWithSerial()
+  // alone wouldn't cover that path. Ramps are elapsed-time based and just
+  // catch up when the flash (<=80ms) ends.
+  if (!effectsMode || midiFlashActive) {
     return;
   }
   updateEffectNoise();
@@ -807,6 +824,113 @@ void updateEffectFades() {
   }
   if (sentAny) {
     lastLinkDutyMillis = millis();
+  }
+}
+
+// ---- MIDI note flash ------------------------------------------------------
+// The MIDI_NOTE_LIGHT_REAL board (a XIAO ESP32-S3 watching a serial MIDI
+// stream) joins the SoftAP above and forwards each Note On as a
+// [0xAF][velocity] frame. When enabled ('g' toggles, on by default), every
+// frame flashes ALL seven channels -- the 4 local pins directly, the 3
+// extender channels via the 0xAB brightness frame -- at a velocity-scaled
+// brightness for a velocity-scaled duration, then hands the pins back to
+// whatever mode was running (current chase step, test-all level, effects
+// ramps). It's an overlay, not a mode: the chase/effects clock keeps
+// advancing underneath, only the pin writes pause (see delayWithSerial).
+// Blackout and calibration outrank it. The velocity mapping mirrors the
+// sender's matrix flash: min..max shaped by a curve exponent (>1 = ease-in,
+// so only hard hits reach full).
+static bool midiFlashEnabled = true;
+static unsigned long midiFlashStartMillis = 0;
+static unsigned long midiFlashDurationMs = 0;
+
+static const uint16_t MIDI_FLASH_DUTY_MIN = 600;     // duty at velocity 1
+static const uint16_t MIDI_FLASH_DUTY_MAX = PWM_MAX; // duty at velocity 127
+static const float MIDI_FLASH_BRIGHT_CURVE = 2.0f;
+static const unsigned long MIDI_FLASH_DUR_MIN_MS = 40;
+static const unsigned long MIDI_FLASH_DUR_MAX_MS = 80;
+static const float MIDI_FLASH_DUR_CURVE = 1.5f;
+
+float midiFlashMap(uint8_t velocity, float outMin, float outMax, float curve) {
+  float t = ((float)velocity - 1.0f) / 126.0f;
+  if (t < 0.0f) t = 0.0f;
+  if (t > 1.0f) t = 1.0f;
+  t = powf(t, curve);
+  return outMin + t * (outMax - outMin);
+}
+
+void onMidiFlash(uint8_t velocity) {
+  if (!midiFlashEnabled) {
+    static bool announced = false;
+    if (!announced) { // note the stream exists once, then stay quiet
+      announced = true;
+      Serial.println("[MIDI] flash frames arriving but MIDI_FLASH is off ('g' enables)");
+    }
+    return;
+  }
+  if (blackout || calibrateMode) {
+    return; // blackout is absolute; calibration needs one unambiguous lamp
+  }
+
+  uint16_t duty = (uint16_t)midiFlashMap(velocity, MIDI_FLASH_DUTY_MIN,
+                                         MIDI_FLASH_DUTY_MAX, MIDI_FLASH_BRIGHT_CURVE);
+  unsigned long duration = (unsigned long)midiFlashMap(velocity, MIDI_FLASH_DUR_MIN_MS,
+                                                       MIDI_FLASH_DUR_MAX_MS, MIDI_FLASH_DUR_CURVE);
+
+  fadingPin = 255; // the overlay owns the pins; a mid-ramp chase fade would fight it
+  uint16_t out = scaleDuty(duty); // the audio master scale dims flashes too
+  for (uint8_t i = 0; i < 4; i++) {
+    analogWrite(EFFECT_LOCAL_PINS[i], activeLow ? PWM_MAX - out : out);
+    // Record what the overlay wrote as the effects engine's notion of "last
+    // written", so its change-detected writes re-drive exactly the channels
+    // that differ once the flash ends.
+    lastLocalOut[i] = out;
+  }
+  sendLinkBrightness(out);
+  uint8_t duty8 = (uint8_t)((uint32_t)out * 255 / PWM_MAX);
+  for (uint8_t i = 0; i < 3; i++) {
+    lastSentExtenderDuty[i] = duty8;
+  }
+
+  bool retrigger = midiFlashActive; // a new note mid-flash just restarts the clock
+  midiFlashActive = true;
+  midiFlashStartMillis = millis();
+  midiFlashDurationMs = duration;
+  Serial.printf("[MIDI] flash vel=%u duty=%u dur=%lums%s\n", (unsigned)velocity,
+                (unsigned)out, duration, retrigger ? " (retrigger)" : "");
+}
+
+// Hands the channels back to whatever mode is active NOW -- keys keep
+// working mid-flash, so this reads the state fresh rather than restoring a
+// snapshot from when the flash started.
+void endMidiFlash() {
+  midiFlashActive = false;
+  if (calibrateMode) {
+    return; // beginCalibrate() already blacked out and re-lit its one lamp
+  }
+  if (testAllMode) {
+    applyTestAll();
+    return;
+  }
+  if (effectsMode) {
+    return; // updateEffectFades() re-drives from the caches set in onMidiFlash()
+  }
+  // Chase (or blackout/idle, where chaseLitChannel is 255 and everything
+  // goes dark): re-light only the current step's lamp, instantly -- starting
+  // a fade mid-step would look odd.
+  for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
+    bool on = ch == chaseLitChannel;
+    if (ch < 4) {
+      setMosfet(EFFECT_LOCAL_PINS[ch], on);
+    } else {
+      sendLinkCommand(ch - 4, on, false);
+    }
+  }
+}
+
+void updateMidiFlash() {
+  if (midiFlashActive && millis() - midiFlashStartMillis >= midiFlashDurationMs) {
+    endMidiFlash();
   }
 }
 
@@ -876,12 +1000,16 @@ void adjustChaseStep(long deltaMs) {
 
 void applyChaseStep(uint8_t step) {
   chaseLitChannel = channelAtPosition(step);
-  for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
-    bool on = channelPosition[ch] == step;
-    if (ch < 4) {
-      applyLocalPin(EFFECT_LOCAL_PINS[ch], on);
-    } else {
-      sendLinkCommand(ch - 4, on, fadeMode);
+  // While a MIDI flash overlay is lit, leave the pins alone -- endMidiFlash()
+  // re-lights the (freshly advanced) chase channel when the flash ends.
+  if (!midiFlashActive) {
+    for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
+      bool on = channelPosition[ch] == step;
+      if (ch < 4) {
+        applyLocalPin(EFFECT_LOCAL_PINS[ch], on);
+      } else {
+        sendLinkCommand(ch - 4, on, fadeMode);
+      }
     }
   }
 
@@ -909,7 +1037,8 @@ void handleSerial() {
       pendingAudioSync = 0;
       continue;
     }
-    if (b == AUDIO_LEVEL_SYNC_BYTE || b == AUDIO_DEPTH_SYNC_BYTE) {
+    if (b == AUDIO_LEVEL_SYNC_BYTE || b == AUDIO_DEPTH_SYNC_BYTE ||
+        b == MIDI_FLASH_SYNC_BYTE) {
       pendingAudioSync = b;
       continue;
     }
@@ -1029,6 +1158,12 @@ void handleSerial() {
         Serial.println("EFFECTS_MODE = false");
         applyBlackout(); // everything off; the chase re-lights on its next step
       }
+    } else if (c == 'g') {
+      midiFlashEnabled = !midiFlashEnabled;
+      Serial.printf("MIDI_FLASH = %s\n", midiFlashEnabled ? "true" : "false");
+      if (!midiFlashEnabled && midiFlashActive) {
+        endMidiFlash(); // hand the pins back now rather than waiting out the timer
+      }
     } else if (c == 'm') {
       blackout = false; // calibration overrides blackout/test-all/effects
       testAllMode = false;
@@ -1110,9 +1245,15 @@ void delayWithSerial(unsigned long ms) {
     handleSerial();
     pollAudioUdp();
     updateLinkStatus();
-    updateFade();
-    updateEffectFades();
-    updateAudio();
+    updateMidiFlash();
+    // The MIDI flash overlay owns every channel while it's lit; these three
+    // all write duty levels and would fight it, so they pause (<=80ms, the
+    // max flash length) until it ends.
+    if (!midiFlashActive) {
+      updateFade();
+      updateEffectFades();
+      updateAudio();
+    }
     delay(10);
   } while (millis() - start < ms);
 }
@@ -1132,6 +1273,8 @@ void setup() {
   Serial.println("position 1-7; the order is saved to EEPROM and survives reboots).");
   Serial.println("'o'/'l' to raise/lower the audio depth (how much the PC audio level stream");
   Serial.println("dims the lights, 10% per press; see AUDIO_LEVEL_BRIDGE/ for the PC script).");
+  Serial.println("'g' to toggle the MIDI note flash (on by default): note frames from the");
+  Serial.println("MIDI_NOTE_LIGHT_REAL board flash every channel, velocity-scaled.");
 
   // Seed the effects noise from the hardware RNG so each boot wanders
   // differently -- Arduino random() is otherwise deterministic.
