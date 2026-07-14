@@ -39,6 +39,9 @@
 //   e    toggle effects test mode (QLC+ effect ports from effects.h across
 //        all 7 channels, each channel ramping per the effect fade-in/out
 //        times); while active, 'n'/'p' picks the next/previous effect
+//   r    toggle performance mode (ON at boot): effects mode runs and hops
+//        to a different random effect after each random 30-60s interval;
+//        'n'/'p' still picks manually and restarts the countdown
 //   m    calibrate the physical light order: each channel lights alone in
 //        turn and you type the lit lamp's position 1-7; once all seven are
 //        assigned the map is saved to EEPROM flash ('m' mid-run aborts)
@@ -189,6 +192,7 @@ static uint8_t lastAppliedAudioScale = 255; // see updateAudio()
 static const char *AUDIO_AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
 static const uint16_t AUDIO_UDP_PORT = 7777;
 WiFiUDP audioUdp;
+static bool apActive = false; // set once in setupAudioWifi(); read by the status report
 
 void onAudioLevel(uint8_t level) {
   audioLevel = level;
@@ -235,9 +239,9 @@ uint16_t scaleDuty(uint16_t duty) {
 void setupAudioWifi() {
   WiFi.persistent(false); // don't re-burn the same AP config to flash every boot
   WiFi.mode(WIFI_AP);
-  bool apUp = WiFi.softAP(AUDIO_AP_SSID); // no password = open AP
+  apActive = WiFi.softAP(AUDIO_AP_SSID); // no password = open AP
   audioUdp.begin(AUDIO_UDP_PORT);
-  if (apUp) {
+  if (apActive) {
     Serial.printf("[AUDIO] SoftAP '%s' (open) up -- level frames to %s:%u/udp\n",
                   AUDIO_AP_SSID, WiFi.softAPIP().toString().c_str(),
                   (unsigned)AUDIO_UDP_PORT);
@@ -442,6 +446,25 @@ static const uint8_t EFFECT_CHANNELS = 7;
 
 // duty[0..3] -> local pins in chase order, duty[4..6] -> extender 0-2
 static const uint8_t EFFECT_LOCAL_PINS[4] = {MOSFET_PIN_C, MOSFET_PIN_A, MOSFET_PIN_B, MOSFET_PIN_D};
+
+// Performance mode (ON at boot -- the board powers up already running it):
+// effects mode with an auto-switcher on top, hopping to a different randomly
+// chosen effect after each randomly rolled 30-60s interval. 'r' toggles the
+// auto-switching (turning it on also enters effects mode if needed); exiting
+// effects mode ('e'/'t'/'m') pauses the timer without clearing the flag, so
+// re-entering effects mode resumes the hopping.
+static bool performanceMode = true;
+static const unsigned long PERFORMANCE_SWITCH_MIN_MS = 30000;
+static const unsigned long PERFORMANCE_SWITCH_MAX_MS = 60000;
+static unsigned long performanceLastSwitchMillis = 0;
+static unsigned long performanceIntervalMs = PERFORMANCE_SWITCH_MIN_MS;
+
+// Rolls a fresh random interval and restarts the countdown from now.
+void schedulePerformanceSwitch() {
+  performanceLastSwitchMillis = millis();
+  performanceIntervalMs =
+      (unsigned long)random(PERFORMANCE_SWITCH_MIN_MS, PERFORMANCE_SWITCH_MAX_MS + 1);
+}
 
 // ---- Physical light-order map -------------------------------------------
 // The lamps can be hung in any physical order, independent of which pin
@@ -843,6 +866,8 @@ void updateEffectFades() {
 static bool midiFlashEnabled = true;
 static unsigned long midiFlashStartMillis = 0;
 static unsigned long midiFlashDurationMs = 0;
+static bool midiSeen = false;              // any [0xAF] frame since boot
+static unsigned long lastMidiRxMillis = 0; // meaningful once midiSeen
 
 static const uint16_t MIDI_FLASH_DUTY_MIN = 600;     // duty at velocity 1
 static const uint16_t MIDI_FLASH_DUTY_MAX = PWM_MAX; // duty at velocity 127
@@ -860,6 +885,10 @@ float midiFlashMap(uint8_t velocity, float outMin, float outMax, float curve) {
 }
 
 void onMidiFlash(uint8_t velocity) {
+  // Track the stream's liveness even when the flash itself is toggled off,
+  // so the periodic status report can still say the MIDI board is alive.
+  midiSeen = true;
+  lastMidiRxMillis = millis();
   if (!midiFlashEnabled) {
     static bool announced = false;
     if (!announced) { // note the stream exists once, then stay quiet
@@ -972,6 +1001,29 @@ void selectEffect(uint8_t index) {
   Serial.printf("[FX] effect %u/%u: %s\n", (unsigned)(effectIndex + 1),
                 (unsigned)EFFECT_COUNT, EFFECTS[effectIndex].name);
   applyEffectFrame();
+}
+
+// The performance-mode timer tick (runs from delayWithSerial(), so a switch
+// lands within ~10ms of its deadline regardless of the current step length).
+// Picks among the OTHER effects so a hop always visibly changes the pattern.
+void updatePerformanceMode() {
+  if (!performanceMode || !effectsMode) {
+    return;
+  }
+  if (millis() - performanceLastSwitchMillis < performanceIntervalMs) {
+    return;
+  }
+  schedulePerformanceSwitch();
+  uint8_t next = effectIndex;
+  if (EFFECT_COUNT > 1) {
+    next = (uint8_t)random(EFFECT_COUNT - 1);
+    if (next >= effectIndex) {
+      next++;
+    }
+  }
+  Serial.printf("[PERF] auto-switching effect (next hop in %lus)\n",
+                performanceIntervalMs / 1000);
+  selectEffect(next);
 }
 
 // Chase sequence: exactly one lamp lit at a time, chaseStepMs per step,
@@ -1153,6 +1205,7 @@ void handleSerial() {
         Serial.println("EFFECTS_MODE = true ('n'/'p' effect, ']'/'[' speed, '='/'-' fade-in, '.'/',' fade-out (x10 shifted), 'e' exits;");
         Serial.printf("noise depths: 'a'/'z' brightness %u%%, 's'/'x' fade-in %u%%, 'd'/'c' fade-out %u%%, 'f'/'v' period %lums)\n",
                       (unsigned)noiseBrightnessPct, (unsigned)noiseFadeInPct, (unsigned)noiseFadeOutPct, noisePeriodMs);
+        schedulePerformanceSwitch(); // fresh countdown, not an instant hop off a stale timer
         selectEffect(effectIndex);
       } else {
         Serial.println("EFFECTS_MODE = false");
@@ -1169,13 +1222,30 @@ void handleSerial() {
       testAllMode = false;
       effectsMode = false;
       beginCalibrate();
+    } else if (c == 'r') {
+      performanceMode = !performanceMode;
+      Serial.printf("PERFORMANCE_MODE = %s\n", performanceMode ? "true" : "false");
+      if (performanceMode) {
+        schedulePerformanceSwitch(); // a full fresh interval from right now
+        if (!effectsMode) { // performance mode means effects running
+          blackout = false;
+          testAllMode = false;
+          effectsMode = true;
+          applyBlackout();    // same known-dark entry as the 'e' handler
+          resetEffectFades();
+          selectEffect((uint8_t)random(EFFECT_COUNT));
+        }
+      }
     } else if (c == 'n' || c == 'p') {
       if (!effectsMode) {
         Serial.println("('n'/'p' only selects effects while EFFECTS active -- press 'e' first)");
-      } else if (c == 'n') {
-        selectEffect((effectIndex + 1) % EFFECT_COUNT);
       } else {
-        selectEffect((effectIndex + EFFECT_COUNT - 1) % EFFECT_COUNT);
+        if (c == 'n') {
+          selectEffect((effectIndex + 1) % EFFECT_COUNT);
+        } else {
+          selectEffect((effectIndex + EFFECT_COUNT - 1) % EFFECT_COUNT);
+        }
+        schedulePerformanceSwitch(); // a manual pick restarts the auto-switch countdown
       }
     } else if (c != '\r' && c != '\n' && c != '\t' && c != ' ' && c != 0) {
       Serial.printf("(unhandled key 0x%02X '%c')\n", (uint8_t)c, (c >= 32 && c < 127) ? c : '?');
@@ -1236,6 +1306,65 @@ void updateAudio() {
   }
 }
 
+// ---- Periodic connection status -------------------------------------------
+// Every STATUS_REPORT_INTERVAL_MS, one line summarizing every link to the
+// other boards: the extender's serial heartbeat, how many stations have
+// joined the SoftAP (the PC audio bridge and/or the MIDI board), and how
+// recently each wireless stream (audio level frames, MIDI note frames) was
+// heard from. Complements the change-triggered [LINK]/[AUDIO]/[MIDI] logs:
+// those say when something happens, this keeps saying where everything
+// stands -- including the quiet states (WAITING, "no frames yet") that
+// otherwise only show up by their absence.
+static const unsigned long STATUS_REPORT_INTERVAL_MS = 10000;
+static unsigned long lastStatusReportMillis = 0;
+
+void formatAge(char *buf, size_t len, unsigned long sinceMillis) {
+  unsigned long ms = millis() - sinceMillis;
+  snprintf(buf, len, "%lu.%lus ago", ms / 1000, (ms % 1000) / 100);
+}
+
+void printConnectionStatus() {
+  if (millis() - lastStatusReportMillis < STATUS_REPORT_INTERVAL_MS) {
+    return;
+  }
+  lastStatusReportMillis = millis();
+
+  char age[24];
+  Serial.print("[STATUS] extender: ");
+  if (linkState == LINK_UP) {
+    formatAge(age, sizeof(age), lastLinkRxMillis);
+    Serial.printf("UP (heartbeat %s)", age);
+  } else if (linkState == LINK_WAITING) {
+    Serial.print("WAITING (no heartbeat since boot)");
+  } else if (lastLinkRxMillis == 0) {
+    Serial.print("DOWN (never heard from)");
+  } else {
+    formatAge(age, sizeof(age), lastLinkRxMillis);
+    Serial.printf("DOWN (last heartbeat %s)", age);
+  }
+
+  if (apActive) {
+    Serial.printf(" | AP: %u station(s)", (unsigned)WiFi.softAPgetStationNum());
+  } else {
+    Serial.print(" | AP: down");
+  }
+
+  if (audioActive) {
+    formatAge(age, sizeof(age), lastAudioRxMillis);
+    Serial.printf(" | audio: active (level %u, %s)", (unsigned)audioLevel, age);
+  } else {
+    Serial.print(" | audio: none");
+  }
+
+  if (midiSeen) {
+    formatAge(age, sizeof(age), lastMidiRxMillis);
+    Serial.printf(" | MIDI: last note %s%s", age, midiFlashEnabled ? "" : " (flash off)");
+  } else {
+    Serial.print(" | MIDI: no frames yet");
+  }
+  Serial.println();
+}
+
 // Same as delay(), but keeps polling serial, the audio stream, the link
 // status, and any in-progress fade so they all stay responsive within ~10ms
 // instead of waiting out the rest of the chase step.
@@ -1245,6 +1374,7 @@ void delayWithSerial(unsigned long ms) {
     handleSerial();
     pollAudioUdp();
     updateLinkStatus();
+    printConnectionStatus();
     updateMidiFlash();
     // The MIDI flash overlay owns every channel while it's lit; these three
     // all write duty levels and would fight it, so they pause (<=80ms, the
@@ -1253,6 +1383,7 @@ void delayWithSerial(unsigned long ms) {
       updateFade();
       updateEffectFades();
       updateAudio();
+      updatePerformanceMode();
     }
     delay(10);
   } while (millis() - start < ms);
@@ -1275,6 +1406,8 @@ void setup() {
   Serial.println("dims the lights, 10% per press; see AUDIO_LEVEL_BRIDGE/ for the PC script).");
   Serial.println("'g' to toggle the MIDI note flash (on by default): note frames from the");
   Serial.println("MIDI_NOTE_LIGHT_REAL board flash every channel, velocity-scaled.");
+  Serial.println("'r' to toggle performance mode (ON at boot): effects mode runs and hops to a");
+  Serial.println("different random effect every 30-60s ('n'/'p' still picks manually).");
 
   // Seed the effects noise from the hardware RNG so each boot wanders
   // differently -- Arduino random() is otherwise deterministic.
@@ -1295,6 +1428,15 @@ void setup() {
   pinMode(MOSFET_PIN_B, OUTPUT);
   pinMode(MOSFET_PIN_C, OUTPUT);
   pinMode(MOSFET_PIN_D, OUTPUT);
+
+  // Boot straight into performance mode: effects running from a randomly
+  // picked starting effect, auto-hopping per updatePerformanceMode(). Must
+  // come after the pinMode calls above (selectEffect() drives the pins) and
+  // after randomSeed() so the first pick differs boot to boot.
+  effectsMode = true;
+  resetEffectFades();
+  schedulePerformanceSwitch();
+  selectEffect((uint8_t)random(EFFECT_COUNT));
 }
 
 void loop() {

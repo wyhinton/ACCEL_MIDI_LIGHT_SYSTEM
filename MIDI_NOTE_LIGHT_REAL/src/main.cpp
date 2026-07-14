@@ -109,11 +109,26 @@ float mapCurved(float in, float inMin, float inMax,
 // powered/idle. It's the resting state between flashes.
 #define POWER_LED_BRIGHTNESS 40   // dim so it isn't distracting (0..255)
 
+// A second pixel in the bottom-LEFT corner blinks the MULTIPLEX link state:
+// red while the SoftAP join hasn't completed (or has dropped), orange once
+// connected. It always blinks -- the color is the signal -- so a solid or
+// dark corner means the sketch isn't running, not a link state.
+#define LINK_PIXEL_X   0
+#define LINK_PIXEL_Y   (MATRIX_HEIGHT - 1)
+#define LINK_BLINK_MS  500   // each on/off phase lasts this long
+
 void showPowerIndicator() {
   matrix.setBrightness(POWER_LED_BRIGHTNESS);
   matrix.fillScreen(0);
   // Bottom-right corner pixel.
   matrix.drawPixel(MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1, matrix.Color(0, 255, 0));
+  // Bottom-left corner: the MULTIPLEX link pixel in its current blink phase.
+  if ((millis() / LINK_BLINK_MS) % 2 == 0) {
+    bool up = (WiFi.status() == WL_CONNECTED);
+    matrix.drawPixel(LINK_PIXEL_X, LINK_PIXEL_Y,
+                     up ? matrix.Color(255, 90, 0)   // orange = link up
+                        : matrix.Color(255, 0, 0));  // red = still joining
+  }
   matrix.show();
 }
 
@@ -180,6 +195,23 @@ void updateMultiplexLinkStatus() {
     Serial.print("[");   Serial.print(millis());
     Serial.println(" ms] MULTIPLEX link DOWN (auto-reconnect running)");
   }
+}
+
+// Drives the link pixel's blink: repaints the idle frame whenever the blink
+// phase or the link state changes. A note flash owns the whole matrix, so
+// this idles while one is lit -- flashOff() repaints the idle frame (power
+// dot + link pixel, via showPowerIndicator) the moment it ends.
+unsigned long lastLinkPixelPhase = (unsigned long)-1; // forces the first draw
+bool          lastLinkPixelUp    = false;
+
+void updateLinkPixel() {
+  if (flashActive) return;
+  unsigned long phase = millis() / LINK_BLINK_MS;
+  bool up = (WiFi.status() == WL_CONNECTED);
+  if (phase == lastLinkPixelPhase && up == lastLinkPixelUp) return;
+  lastLinkPixelPhase = phase;
+  lastLinkPixelUp    = up;
+  showPowerIndicator();
 }
 
 // -------- ESP-NOW (mirror the flash to the receiver board) --------
@@ -456,6 +488,9 @@ void loop() {
     Serial.print("["); Serial.print(millis());
     Serial.println(" ms] FLASH OFF");
   }
+
+  // Blink the MULTIPLEX link pixel (red = joining, orange = connected).
+  updateLinkPixel();
 
   // Periodic alive ping with a running count of notes seen so far.
   unsigned long now = millis();

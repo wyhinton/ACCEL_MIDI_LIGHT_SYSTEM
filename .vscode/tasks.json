@@ -49,6 +49,33 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Upload to Midi Light",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload & Monitor Midi Light",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Monitor Midi Light",
+      "type": "shell",
+      "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe",
+      "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Run Light Chase UI",
       "type": "shell",
       "command": "npm",
