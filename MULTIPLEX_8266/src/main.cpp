@@ -51,6 +51,9 @@
 //   g    toggle the MIDI note flash (on by default): [0xAF][velocity] frames
 //        from the MIDI_NOTE_LIGHT_REAL board flash every channel at a
 //        velocity-scaled brightness/duration, overlaid on the running mode
+//   j    simulate one MIDI Note On (fixed velocity) for testing without the
+//        MIDI_NOTE_LIGHT_REAL board attached -- also feeds the note-rate
+//        chase/effects tempo speedup (see effectiveChaseStepMs())
 //   Effects noise (see updateEffectNoise()) -- how deeply the per-channel
 //   wandering noise randomizes the effect, each its own 0-100% depth:
 //   a/z  raise/lower the brightness depth (lit channels shimmer dimmer)
@@ -459,6 +462,15 @@ static const unsigned long PERFORMANCE_SWITCH_MAX_MS = 60000;
 static unsigned long performanceLastSwitchMillis = 0;
 static unsigned long performanceIntervalMs = PERFORMANCE_SWITCH_MIN_MS;
 
+// Ambient floor while performance mode runs: effects never dim below this,
+// and the MIDI note flash (see onMidiFlash()) adds its velocity-scaled boost
+// on top of it instead of on top of MIDI_FLASH_DUTY_MIN.
+static uint8_t performanceBaseBrightnessPct = 50;
+
+uint16_t performanceBaseDuty() {
+  return (uint16_t)((uint32_t)PWM_MAX * performanceBaseBrightnessPct / 100);
+}
+
 // Rolls a fresh random interval and restarts the countdown from now.
 void schedulePerformanceSwitch() {
   performanceLastSwitchMillis = millis();
@@ -828,6 +840,14 @@ void updateEffectFades() {
       uint32_t nv = effectNoise(i);
       out = (uint16_t)((uint32_t)out * (25500 - nv * noiseBrightnessPct) / 25500);
     }
+    // Performance mode never dims below its base brightness -- the MIDI
+    // flash (onMidiFlash()) adds on top of this same floor.
+    if (performanceMode) {
+      uint16_t base = performanceBaseDuty();
+      if (out < base) {
+        out = base;
+      }
+    }
     // Audio master scale last, so a moving level re-triggers the
     // change-detected writes below on its own -- no extra plumbing needed.
     out = scaleDuty(out);
@@ -863,18 +883,24 @@ void updateEffectFades() {
 // Blackout and calibration outrank it. The velocity mapping mirrors the
 // sender's matrix flash: min..max shaped by a curve exponent (>1 = ease-in,
 // so only hard hits reach full).
+//
+// While performance mode is running, that floor is the configurable base
+// brightness below instead of MIDI_FLASH_DUTY_MIN: the lights sit at that
+// level between notes and each flash adds velocity-scaled brightness on top
+// of it, still topping out at PWM_MAX on a hard hit.
 static bool midiFlashEnabled = true;
 static unsigned long midiFlashStartMillis = 0;
 static unsigned long midiFlashDurationMs = 0;
 static bool midiSeen = false;              // any [0xAF] frame since boot
 static unsigned long lastMidiRxMillis = 0; // meaningful once midiSeen
 
-static const uint16_t MIDI_FLASH_DUTY_MIN = 600;     // duty at velocity 1
+static const uint16_t MIDI_FLASH_DUTY_MIN = 600;     // duty at velocity 1 (outside performance mode)
 static const uint16_t MIDI_FLASH_DUTY_MAX = PWM_MAX; // duty at velocity 127
 static const float MIDI_FLASH_BRIGHT_CURVE = 2.0f;
 static const unsigned long MIDI_FLASH_DUR_MIN_MS = 40;
 static const unsigned long MIDI_FLASH_DUR_MAX_MS = 80;
 static const float MIDI_FLASH_DUR_CURVE = 1.5f;
+static const uint8_t MIDI_SIM_VELOCITY = 100; // velocity used by the 'j' test-key simulated note
 
 float midiFlashMap(uint8_t velocity, float outMin, float outMax, float curve) {
   float t = ((float)velocity - 1.0f) / 126.0f;
@@ -884,11 +910,59 @@ float midiFlashMap(uint8_t velocity, float outMin, float outMax, float curve) {
   return outMin + t * (outMax - outMin);
 }
 
+// ---- MIDI-driven tempo ------------------------------------------------
+// How busy the incoming Note On stream has been over the trailing 10s
+// speeds up the chase/effects step interval: the more notes per second,
+// the shorter the step, bottoming out at MIDI_TEMPO_MIN_STEP_MS. As the
+// note stream thins out, old hits fall out of the 10s window and the rate
+// decays back toward 0, easing the interval back to the user-configured
+// chaseStepMs (']'/'[') rather than snapping. Tracked independent of
+// midiFlashEnabled so tempo still follows the notes even with the visual
+// flash turned off.
+static const unsigned long MIDI_TEMPO_WINDOW_MS = 10000;
+static const unsigned long MIDI_TEMPO_MIN_STEP_MS = 1;
+static const float MIDI_TEMPO_RATE_MAX_HZ = 8.0f; // notes/sec that reaches the min step
+static const uint8_t MIDI_TEMPO_HISTORY_SIZE = 64;
+static unsigned long midiNoteTimes[MIDI_TEMPO_HISTORY_SIZE];
+static uint8_t midiNoteTimesHead = 0;
+static uint8_t midiNoteTimesCount = 0;
+
+void recordMidiNoteForTempo() {
+  midiNoteTimes[midiNoteTimesHead] = millis();
+  midiNoteTimesHead = (midiNoteTimesHead + 1) % MIDI_TEMPO_HISTORY_SIZE;
+  if (midiNoteTimesCount < MIDI_TEMPO_HISTORY_SIZE) {
+    midiNoteTimesCount++;
+  }
+}
+
+// Notes/sec seen in the trailing MIDI_TEMPO_WINDOW_MS, walking back from the
+// most recently recorded note until one falls outside the window.
+float midiNoteRateHz() {
+  if (midiNoteTimesCount == 0) {
+    return 0.0f;
+  }
+  unsigned long now = millis();
+  uint8_t counted = 0;
+  for (uint8_t i = 0; i < midiNoteTimesCount; i++) {
+    uint8_t idx = (uint8_t)((midiNoteTimesHead + MIDI_TEMPO_HISTORY_SIZE - 1 - i) % MIDI_TEMPO_HISTORY_SIZE);
+    if (now - midiNoteTimes[idx] > MIDI_TEMPO_WINDOW_MS) {
+      break; // entries are recorded in order, so everything older also expired
+    }
+    counted++;
+  }
+  return (float)counted / ((float)MIDI_TEMPO_WINDOW_MS / 1000.0f);
+}
+
+// Defined below, once chaseStepMs exists (see the Chase sequence section) --
+// eases chaseStepMs down as the MIDI_TEMPO_WINDOW_MS note rate climbs.
+unsigned long effectiveChaseStepMs();
+
 void onMidiFlash(uint8_t velocity) {
   // Track the stream's liveness even when the flash itself is toggled off,
   // so the periodic status report can still say the MIDI board is alive.
   midiSeen = true;
   lastMidiRxMillis = millis();
+  recordMidiNoteForTempo();
   if (!midiFlashEnabled) {
     static bool announced = false;
     if (!announced) { // note the stream exists once, then stay quiet
@@ -901,7 +975,11 @@ void onMidiFlash(uint8_t velocity) {
     return; // blackout is absolute; calibration needs one unambiguous lamp
   }
 
-  uint16_t duty = (uint16_t)midiFlashMap(velocity, MIDI_FLASH_DUTY_MIN,
+  // In performance mode the notes flash on top of the base brightness floor
+  // rather than MIDI_FLASH_DUTY_MIN, so quiet passages never go darker than
+  // that base and a hard hit still reaches full.
+  uint16_t flashFloor = (performanceMode && effectsMode) ? performanceBaseDuty() : MIDI_FLASH_DUTY_MIN;
+  uint16_t duty = (uint16_t)midiFlashMap(velocity, flashFloor,
                                          MIDI_FLASH_DUTY_MAX, MIDI_FLASH_BRIGHT_CURVE);
   unsigned long duration = (unsigned long)midiFlashMap(velocity, MIDI_FLASH_DUR_MIN_MS,
                                                        MIDI_FLASH_DUR_MAX_MS, MIDI_FLASH_DUR_CURVE);
@@ -1048,6 +1126,23 @@ void adjustChaseStep(long deltaMs) {
   }
   chaseStepMs = (unsigned long)updated;
   Serial.printf("CHASE_STEP_MS = %lu\n", chaseStepMs);
+}
+
+// Chase/effects step length: chaseStepMs eased down toward
+// MIDI_TEMPO_MIN_STEP_MS as the MIDI note rate (see midiNoteRateHz() above)
+// climbs toward MIDI_TEMPO_RATE_MAX_HZ, falling straight back to chaseStepMs
+// once the stream goes quiet and the rate decays out of the window.
+unsigned long effectiveChaseStepMs() {
+  float rate = midiNoteRateHz();
+  if (rate <= 0.0f || chaseStepMs <= MIDI_TEMPO_MIN_STEP_MS) {
+    return chaseStepMs;
+  }
+  float t = rate / MIDI_TEMPO_RATE_MAX_HZ;
+  if (t > 1.0f) {
+    t = 1.0f;
+  }
+  unsigned long span = chaseStepMs - MIDI_TEMPO_MIN_STEP_MS;
+  return chaseStepMs - (unsigned long)(t * (float)span);
 }
 
 void applyChaseStep(uint8_t step) {
@@ -1236,6 +1331,8 @@ void handleSerial() {
           selectEffect((uint8_t)random(EFFECT_COUNT));
         }
       }
+    } else if (c == 'j') {
+      onMidiFlash(MIDI_SIM_VELOCITY); // fake a Note On for testing without the MIDI board
     } else if (c == 'n' || c == 'p') {
       if (!effectsMode) {
         Serial.println("('n'/'p' only selects effects while EFFECTS active -- press 'e' first)");
@@ -1406,6 +1503,8 @@ void setup() {
   Serial.println("dims the lights, 10% per press; see AUDIO_LEVEL_BRIDGE/ for the PC script).");
   Serial.println("'g' to toggle the MIDI note flash (on by default): note frames from the");
   Serial.println("MIDI_NOTE_LIGHT_REAL board flash every channel, velocity-scaled.");
+  Serial.println("'j' to simulate a MIDI Note On (fixed velocity), for testing without the");
+  Serial.println("MIDI_NOTE_LIGHT_REAL board attached -- also feeds the note-rate chase tempo.");
   Serial.println("'r' to toggle performance mode (ON at boot): effects mode runs and hops to a");
   Serial.println("different random effect every 30-60s ('n'/'p' still picks manually).");
 
@@ -1444,7 +1543,7 @@ void loop() {
     // selectEffect() already applied the current frame; hold it for one
     // step, then advance. Re-check the mode after the delay -- 'e', 't',
     // or a switched effect may have landed mid-delay via handleSerial().
-    delayWithSerial(chaseStepMs);
+    delayWithSerial(effectiveChaseStepMs());
     if (effectsMode) {
       effectStep = (effectStep + 1) % EFFECTS[effectIndex].stepCount(EFFECT_CHANNELS, 1);
       applyEffectFrame();
@@ -1460,6 +1559,6 @@ void loop() {
       break; // bail out mid-sequence so a mode change doesn't wait out the chase
     }
     applyChaseStep(step);
-    delayWithSerial(chaseStepMs);
+    delayWithSerial(effectiveChaseStepMs());
   }
 }
