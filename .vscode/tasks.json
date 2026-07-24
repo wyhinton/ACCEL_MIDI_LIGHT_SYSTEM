@@ -1,0 +1,55 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Upload: WIFI_LOGIN_MAC_SENDER",
+            "type": "shell",
+            "command": "pio run -t upload -e seeed_xiao_esp32s3",
+            "options": {
+                "cwd": "${workspaceFolder}/WIFI_LOGIN_MAC_SENDER"
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Upload: WIFI_LOGIN_PC_RECEIVER",
+            "type": "shell",
+            "command": "pio run -t upload -e seeed_xiao_esp32s3",
+            "options": {
+                "cwd": "${workspaceFolder}/WIFI_LOGIN_PC_RECEIVER"
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Monitor: WIFI_LOGIN_MAC_SENDER",
+            "type": "shell",
+            "command": "pio device monitor -e seeed_xiao_esp32s3",
+            "options": {
+                "cwd": "${workspaceFolder}/WIFI_LOGIN_MAC_SENDER"
+            },
+            "group": "none",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "Wi-Fi Bridge: Send Credentials (UT-001-5G)",
+            "type": "shell",
+            "command": "python3 scripts/mac_wifi_login.py --ssid \"UT-001-5G\" --password \"ut451451\"",
+            "options": {
+                "cwd": "${workspaceFolder}/WIFI_LOGIN_MAC_SENDER"
+            },
+            "group": "none",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ]
+}
