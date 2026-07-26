@@ -72,6 +72,10 @@ unsigned long lastRedBlinkMs = 0;
 #define LIGHT_PWM_CHANNEL  0      // LEDC channel (core 2.x only)
 #define FLASH_DURATION_MS  150    // default MIDI-flash length / fallback
 
+// Hard ceiling on the physical light, 30% of full duty. Applied to both the
+// ambient pulse and MIDI flashes so it never reaches blinding full brightness.
+const uint8_t LIGHT_MAX_BRIGHTNESS = 77;  // 0.3 * 255, rounded
+
 // -------- LED MATRIX --------
 #define MATRIX_PIN    14
 #define MATRIX_WIDTH  8
@@ -132,6 +136,7 @@ volatile uint8_t       flashVelocity   = 0;
 volatile bool          newFlash        = false;
 
 void lightWriteDuty(uint8_t duty) {
+  if (duty > LIGHT_MAX_BRIGHTNESS) duty = LIGHT_MAX_BRIGHTNESS;
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(LIGHT_PIN, duty);
 #else
