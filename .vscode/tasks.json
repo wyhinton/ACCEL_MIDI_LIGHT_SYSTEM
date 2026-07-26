@@ -48,6 +48,14 @@
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
     {
+      "label": "Run Audio Bridge (Windows Loopback)",
+      "type": "shell",
+      "command": "uv",
+      "args": ["run", "${workspaceFolder}/host/audio_bridge.py", "--loopback", "--device", "${input:loopbackDevice}"],
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
+    },
+    {
       "label": "Git Pull",
       "type": "shell",
       "command": "git pull",
@@ -72,6 +80,12 @@
       "type": "promptString",
       "description": "Audio input device name or index (e.g. BlackHole). Leave blank for system default.",
       "default": "BlackHole"
+    },
+    {
+      "id": "loopbackDevice",
+      "type": "promptString",
+      "description": "Windows: output device name/index to loop back (e.g. Speakers, Headphones). Leave blank for the system default output.",
+      "default": ""
     },
     {
       "id": "commitMessage",

@@ -45,8 +45,23 @@ It captures an audio **input** device, computes a smoothed RMS envelope, and
 writes the level byte over BLE at ~40 Hz using `bleak` + `sounddevice`.
 
 Because Python can't grab macOS *system output* directly, route output through a
-virtual loopback (BlackHole) and capture that device. On Windows you can point
-`--device` at "Stereo Mix"/a WASAPI loopback to test the BLE path without a Mac.
+virtual loopback (BlackHole) and capture that device.
+
+### Windows
+
+Use `--loopback` to grab system output audio directly via WASAPI loopback — no
+Stereo Mix or virtual cable needed (most modern drivers don't expose Stereo Mix
+anyway). This uses [`pyaudiowpatch`](https://github.com/s0d3s/PyAudioWPatch),
+installed automatically by `uv run` on Windows (or `pip install pyaudiowpatch`).
+
+```bash
+python host/audio_bridge.py --loopback                        # default speakers
+python host/audio_bridge.py --loopback --device "Headphones"  # a specific output
+python host/audio_bridge.py --list-devices --loopback         # list loopback devices
+```
+
+If your interface still exposes "Stereo Mix" as a regular input device, the
+plain `--device "Stereo Mix"` form (no `--loopback`) also works.
 
 ## Mac app outline (Swift — driverless alternative)
 
