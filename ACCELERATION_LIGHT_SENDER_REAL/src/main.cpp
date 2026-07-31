@@ -28,7 +28,6 @@
 #define AUDIO_CHAR_UUID    "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
 
 const unsigned long LEVEL_TIMEOUT_MS      = 1500;  // no level this long => full bright
-const unsigned long RED_BLINK_INTERVAL_MS = 3000;  // how often to warn when disconnected
 
 volatile uint8_t       audioLevelRaw = 255;   // last level received (set in BLE write cb)
 volatile unsigned long lastLevelMs   = 0;      // when it arrived
@@ -36,7 +35,6 @@ float                  audioLevelSmoothed = 255.0f;  // on-device EMA (bridges g
 
 volatile bool bleConnected  = false;   // a BLE client (the PC) is connected
 bool          bleWasUp      = false;   // debounced, for the connect burst
-unsigned long lastRedBlinkMs = 0;
 
 class LevelWriteCallback : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
@@ -147,6 +145,11 @@ void lightBegin() {
 // Matrix is bright at close range, so the pulse is scaled down to this ceiling.
 const uint8_t MATRIX_MAX_BRIGHTNESS = 90;
 
+// Corner pixel reserved as a live BLE status indicator (red=disconnected,
+// green=connected), drawn on top of the pulse every frame.
+#define STATUS_PIXEL_X 0
+#define STATUS_PIXEL_Y 0
+
 Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
   MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_PIN,
   NEO_MATRIX_TOP + NEO_MATRIX_LEFT +
@@ -183,24 +186,18 @@ void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
   matrix.show();
 }
 
-// Show BLE link status on the matrix: a green burst the instant the PC
-// connects, occasional red while no PC is connected.
+// BLE link status: a full-matrix green burst the instant the PC connects;
+// otherwise a single corner pixel tracks live status every frame (see
+// STATUS_PIXEL_X/Y in the render step of loop()).
 void updateBleStatus() {
-  unsigned long now = millis();
-
   if (bleConnected && !bleWasUp) {
     bleWasUp = true;
     Serial.println("BLE LINK UP (PC connected)");
     blinkMatrix(0, 255, 0, 4, 150, 120);   // green: PC connected
-  } else if (!bleConnected) {
-    if (bleWasUp) {
-      bleWasUp = false;
-      Serial.println("BLE LINK DOWN (PC disconnected)");
-    }
-    if (now - lastRedBlinkMs >= RED_BLINK_INTERVAL_MS) {
-      lastRedBlinkMs = now;
-      blinkMatrix(255, 0, 0, 1, 150, 0);   // red: no PC yet
-    }
+    matrix.setBrightness(MATRIX_MAX_BRIGHTNESS);   // blinkMatrix leaves brightness at 120
+  } else if (!bleConnected && bleWasUp) {
+    bleWasUp = false;
+    Serial.println("BLE LINK DOWN (PC disconnected)");
   }
 }
 
@@ -220,6 +217,10 @@ void setup() {
 
   // Startup banner: 'S' identifies this board as the SENDER.
   showStartupLetter('S', 0, 0, 255, 1000);
+
+  // Fixed brightness ceiling for normal operation. Held constant (instead of
+  // pulsing) so the BLE status pixel stays legible even when the pulse dims.
+  matrix.setBrightness(MATRIX_MAX_BRIGHTNESS);
 
   // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
   pulse.begin(0, 255, 600, 2500);
@@ -245,12 +246,15 @@ void loop() {
   float audioMul = audioLevelSmoothed / 255.0f;   // 0..1
 
   // ---- SMOOTH RANDOM PULSE (base layer), scaled by the audio level ----
-  uint8_t pulseVal   = (uint8_t)(pulse.value(now) * audioMul);      // 0..255
-  uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
+  uint8_t pulseVal = (uint8_t)(pulse.value(now) * audioMul);      // 0..255
 
   // ---- RENDER MATRIX (every loop) ----
-  matrix.setBrightness(matrixBase);
-  matrix.fillScreen(matrix.Color(255, 255, 255));
+  // Brightness is held fixed (set once in setup()); the pulse itself scales
+  // the pixel color instead, so the status pixel below stays at full
+  // strength even when the pulse dims toward 0.
+  matrix.fillScreen(matrix.Color(pulseVal, pulseVal, pulseVal));
+  matrix.drawPixel(STATUS_PIXEL_X, STATUS_PIXEL_Y,
+                    bleConnected ? matrix.Color(0, 255, 0) : matrix.Color(255, 0, 0));
   matrix.show();
 
   // ---- PWM LIGHT ----

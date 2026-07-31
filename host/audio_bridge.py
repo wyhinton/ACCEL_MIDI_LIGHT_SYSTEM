@@ -37,7 +37,9 @@ Dependencies: pip install -r requirements.txt
 
 import argparse
 import asyncio
+import queue
 import sys
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -59,6 +61,98 @@ SEND_HZ = 40    # BLE writes per second
 _level = 0.0
 _block_count = 0
 
+# GUI status window (set in main() if enabled) and the shared stop signal.
+# The BLE/audio work runs on a background thread; Tkinter owns the main
+# thread. Both sides only touch _ui through its thread-safe setters.
+_ui = None
+_stop_event = threading.Event()
+
+
+class StatusWindow:
+    """Small always-on-top window showing live BLE connect status.
+
+    Runs on the main thread; set_status()/set_level() are called from the
+    background BLE/audio thread and just enqueue updates for _poll() to
+    apply, so this is safe to call from either side.
+    """
+
+    COLORS = {
+        "scanning":     "#e6b800",
+        "connecting":   "#e6b800",
+        "connected":    "#2ecc71",
+        "disconnected": "#e74c3c",
+        "error":        "#e74c3c",
+    }
+
+    def __init__(self, stop_event: threading.Event):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self._tk = tk
+        self.stop_event = stop_event
+        self._queue: "queue.Queue" = queue.Queue()
+
+        self.root = tk.Tk()
+        self.root.title("LightAudioBridge - BLE Status")
+        self.root.geometry("360x150")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.canvas = tk.Canvas(self.root, width=28, height=28, highlightthickness=0)
+        self.dot = self.canvas.create_oval(2, 2, 26, 26, fill=self.COLORS["scanning"], outline="")
+        self.canvas.grid(row=0, column=0, padx=(16, 8), pady=(16, 4))
+
+        self.status_var = tk.StringVar(value="Starting...")
+        ttk.Label(self.root, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=1, sticky="w", pady=(16, 4))
+
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(self.root, textvariable=self.detail_var, wraplength=320, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=16)
+
+        ttk.Label(self.root, text="Audio level").grid(row=2, column=0, columnspan=2,
+                                                        sticky="w", padx=16, pady=(12, 0))
+        self.level_bar = ttk.Progressbar(self.root, orient="horizontal", length=320,
+                                          mode="determinate", maximum=100)
+        self.level_bar.grid(row=3, column=0, columnspan=2, padx=16, pady=(2, 12))
+
+        self._poll()
+
+    def _on_close(self):
+        self.stop_event.set()
+        self.root.destroy()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self._queue.get_nowait()
+                if kind == "status":
+                    state, text, detail = payload
+                    self.canvas.itemconfig(self.dot, fill=self.COLORS.get(state, "#999999"))
+                    self.status_var.set(text)
+                    self.detail_var.set(detail)
+                elif kind == "level":
+                    self.level_bar["value"] = payload
+        except queue.Empty:
+            pass
+        if not self.stop_event.is_set():
+            self.root.after(100, self._poll)
+
+    # -- thread-safe setters, called from the background BLE/audio thread --
+    def set_status(self, state: str, text: str, detail: str = ""):
+        self._queue.put(("status", (state, text, detail)))
+
+    def set_level(self, level_0_1: float):
+        self._queue.put(("level", max(0.0, min(1.0, level_0_1)) * 100))
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop_event.set()
+
 
 def update_level(rms: float, gain: float):
     """Fold one audio block's RMS into the shared envelope; log a meter periodically."""
@@ -67,6 +161,8 @@ def update_level(rms: float, gain: float):
     coeff = ATTACK if target > _level else RELEASE
     _level += (target - _level) * coeff
     _block_count += 1
+    if _ui is not None:
+        _ui.set_level(_level)
     if _block_count % 100 == 0:
         bar = "#" * int(_level * 40)
         print(f"[audio] rms={rms:.4f}  gain={gain:.1f}  target={target:.3f}  "
@@ -126,24 +222,41 @@ def list_loopback_devices():
 
 
 async def find_bridge(timeout: float):
-    print(f"[ble] Scanning for '{DEVICE_NAME}' (timeout={timeout}s)...")
-    dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=timeout)
-    if dev is None:
-        print(f"[ble] Name scan came up empty — falling back to service UUID scan...")
-        dev = await BleakScanner.find_device_by_filter(
-            lambda d, adv: SERVICE_UUID.lower() in [u.lower() for u in adv.service_uuids],
-            timeout=timeout,
-        )
-    if dev:
-        print(f"[ble] Found device: {dev.name}  address={dev.address}")
-    else:
-        print(f"[ble] No device found after {timeout}s.")
-    return dev
+    """Scan for the light board, retrying forever until found or _stop_event fires."""
+    attempt = 0
+    while not _stop_event.is_set():
+        attempt += 1
+        suffix = "" if attempt == 1 else f" (attempt {attempt})"
+        print(f"[ble] Scanning for '{DEVICE_NAME}'{suffix} (timeout={timeout}s)...")
+        if _ui is not None:
+            _ui.set_status("scanning", "Searching for ESP32...",
+                            f"Attempt {attempt} — looking for '{DEVICE_NAME}'")
+
+        dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=timeout)
+        if dev is None:
+            print(f"[ble] Name scan came up empty — falling back to service UUID scan...")
+            dev = await BleakScanner.find_device_by_filter(
+                lambda d, adv: SERVICE_UUID.lower() in [u.lower() for u in adv.service_uuids],
+                timeout=timeout,
+            )
+
+        if dev:
+            print(f"[ble] Found device: {dev.name}  address={dev.address}")
+            if _ui is not None:
+                _ui.set_status("connecting", "Device found, connecting...",
+                                f"{dev.name or DEVICE_NAME} @ {dev.address}")
+            return dev
+
+        print(f"[ble] No device found after {timeout}s. Retrying...")
+        if _ui is not None:
+            _ui.set_status("disconnected", "ESP32 not found", "Retrying — is the board powered on?")
+
+    return None
 
 
 async def ble_send_loop(client):
     period = 1.0 / SEND_HZ
-    while True:
+    while not _stop_event.is_set():
         level_byte = int(round(min(max(_level, 0.0), 1.0) * 255))
         try:
             await client.write_gatt_char(CHAR_UUID, bytes([level_byte]), response=False)
@@ -157,12 +270,6 @@ async def run_sounddevice(args):
     device = find_input_device(args.device)
     print(f"Capturing audio from: {device}")
 
-    bridge = await find_bridge(args.scan_timeout)
-    if bridge is None:
-        print(f"Could not find BLE device '{DEVICE_NAME}'. Is the MIDI board powered?",
-              file=sys.stderr)
-        return 1
-
     stream = sd.InputStream(
         device=device,
         channels=1,
@@ -171,10 +278,25 @@ async def run_sounddevice(args):
         callback=make_audio_callback(args.gain),
     )
 
-    async with BleakClient(bridge) as client:
-        print(f"Connected to {bridge.address}. Streaming level (Ctrl+C to stop)...")
-        with stream:
-            await ble_send_loop(client)
+    with stream:
+        while not _stop_event.is_set():
+            bridge = await find_bridge(args.scan_timeout)
+            if bridge is None:
+                break   # _stop_event fired mid-scan
+
+            try:
+                async with BleakClient(bridge) as client:
+                    print(f"Connected to {bridge.address}. Streaming level (Ctrl+C to stop)...")
+                    if _ui is not None:
+                        _ui.set_status("connected", "Connected — streaming audio", bridge.address)
+                    await ble_send_loop(client)
+            except Exception as e:
+                print(f"[ble] Connection lost: {e}", file=sys.stderr)
+
+            if not _stop_event.is_set():
+                print("[ble] Disconnected. Reconnecting...")
+                if _ui is not None:
+                    _ui.set_status("disconnected", "Disconnected", "Reconnecting...")
     return 0
 
 
@@ -225,12 +347,6 @@ async def run_wasapi_loopback(args):
 
         print(f"Capturing system audio (WASAPI loopback) from: {device['name']}")
 
-        bridge = await find_bridge(args.scan_timeout)
-        if bridge is None:
-            print(f"Could not find BLE device '{DEVICE_NAME}'. Is the MIDI board powered?",
-                  file=sys.stderr)
-            return 1
-
         stream = p.open(
             format=pyaudio.paInt16,
             channels=int(device["maxInputChannels"]),
@@ -242,14 +358,31 @@ async def run_wasapi_loopback(args):
             stream_callback=make_pyaudio_callback(args.gain),
         )
 
-        async with BleakClient(bridge) as client:
-            print(f"Connected to {bridge.address}. Streaming level (Ctrl+C to stop)...")
-            stream.start_stream()
-            try:
-                await ble_send_loop(client)
-            finally:
-                stream.stop_stream()
-                stream.close()
+        try:
+            while not _stop_event.is_set():
+                bridge = await find_bridge(args.scan_timeout)
+                if bridge is None:
+                    break   # _stop_event fired mid-scan
+
+                try:
+                    async with BleakClient(bridge) as client:
+                        print(f"Connected to {bridge.address}. Streaming level (Ctrl+C to stop)...")
+                        if _ui is not None:
+                            _ui.set_status("connected", "Connected — streaming audio", bridge.address)
+                        stream.start_stream()
+                        try:
+                            await ble_send_loop(client)
+                        finally:
+                            stream.stop_stream()
+                except Exception as e:
+                    print(f"[ble] Connection lost: {e}", file=sys.stderr)
+
+                if not _stop_event.is_set():
+                    print("[ble] Disconnected. Reconnecting...")
+                    if _ui is not None:
+                        _ui.set_status("disconnected", "Disconnected", "Reconnecting...")
+        finally:
+            stream.close()
     finally:
         p.terminate()
     return 0
@@ -285,6 +418,8 @@ def main():
                         "device's own rate)")
     p.add_argument("--blocksize", type=int, default=512)
     p.add_argument("--scan-timeout", type=float, default=10.0)
+    p.add_argument("--no-gui", action="store_true",
+                   help="skip the status window; console output only")
     args = p.parse_args()
 
     if args.list_devices:
@@ -294,11 +429,40 @@ def main():
             list_devices()
         return
 
-    try:
-        runner = run_wasapi_loopback(args) if args.loopback else run_sounddevice(args)
-        sys.exit(asyncio.run(runner))
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    global _ui
+
+    if not args.no_gui:
+        try:
+            _ui = StatusWindow(_stop_event)
+        except Exception as e:
+            print(f"[gui] Could not open status window ({e}); continuing without it.",
+                  file=sys.stderr)
+            _ui = None
+
+    def run_backend():
+        try:
+            runner = run_wasapi_loopback(args) if args.loopback else run_sounddevice(args)
+            asyncio.run(runner)
+        except Exception as e:
+            print(f"[fatal] {e}", file=sys.stderr)
+            if _ui is not None:
+                _ui.set_status("error", "Fatal error", str(e))
+        finally:
+            _stop_event.set()
+
+    backend_thread = threading.Thread(target=run_backend, daemon=True)
+    backend_thread.start()
+
+    if _ui is not None:
+        _ui.run()               # blocks until the window is closed or _stop_event fires
+        _stop_event.set()
+        backend_thread.join(timeout=2)
+    else:
+        try:
+            backend_thread.join()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            _stop_event.set()
 
 
 if __name__ == "__main__":
