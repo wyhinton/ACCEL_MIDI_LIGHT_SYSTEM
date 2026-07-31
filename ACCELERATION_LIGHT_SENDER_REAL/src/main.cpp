@@ -27,6 +27,8 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+#include <EEPROM.h>
+
 // -------- BLE-MIDI (standard Bluetooth-SIG GATT profile) --------
 // Hand-rolled with the raw BLE APIs (rather than a MIDI library) so it's a
 // single, self-contained BLE identity/server. Packet format per the
@@ -37,7 +39,6 @@
 #define MIDI_CHAR_UUID    "7772E5DB-3868-4112-A1A9-F2669D106BF3"
 
 const uint8_t MIDI_NOTE     = 36;   // C1
-const uint8_t MIDI_VELOCITY = 127;
 const uint8_t MIDI_CHANNEL  = 0;    // 0-indexed (MIDI channel 1)
 
 BLECharacteristic *midiChar = nullptr;
@@ -233,6 +234,141 @@ float         prevAccelMag   = 1.0f;
 unsigned long lastCollisionMs = 0;
 bool          midiNotePlaying = false;
 
+// -------- VELOCITY MAPPING (jerk magnitude -> MIDI velocity) --------
+// Impact force (jerk) is linearly mapped from [COLLISION_JERK_THRESHOLD,
+// jerkMaxForVelocity] to [velocityMin, velocityMax], so harder hits fire
+// louder notes. velocityMin/Max and jerkMaxForVelocity are adjustable at
+// runtime over Serial (115200 baud) and persisted to flash-emulated EEPROM
+// so calibration survives a reboot/power cycle. Commands (newline-terminated):
+//   VMIN <1-127>   velocity fired at the collision jerk threshold
+//   VMAX <1-127>   velocity fired at/above JMAX jerk
+//   JMAX <float>   jerk magnitude (g/frame) that saturates to VMAX
+//   SHOW           print current settings
+//   RESET          restore defaults and save
+//   HELP           print this command list
+struct VelocitySettings {
+  uint32_t magic;   // validates the EEPROM blob belongs to this settings layout
+  uint8_t  velocityMin;
+  uint8_t  velocityMax;
+  float    jerkMaxForVelocity;
+};
+
+const uint32_t VELOCITY_SETTINGS_MAGIC = 0x564C4D31;   // "VLM1"
+const VelocitySettings VELOCITY_SETTINGS_DEFAULT = {VELOCITY_SETTINGS_MAGIC, 1, 127, 6.0f};
+
+VelocitySettings velocitySettings = VELOCITY_SETTINGS_DEFAULT;
+
+bool velocitySettingsValid(const VelocitySettings &s) {
+  return s.magic == VELOCITY_SETTINGS_MAGIC
+      && s.velocityMin >= 1 && s.velocityMin <= 127
+      && s.velocityMax >= 1 && s.velocityMax <= 127
+      && s.velocityMax >= s.velocityMin
+      && s.jerkMaxForVelocity > COLLISION_JERK_THRESHOLD;
+}
+
+void velocitySettingsPrint() {
+  Serial.print("[cfg] VMIN="); Serial.print(velocitySettings.velocityMin);
+  Serial.print("  VMAX="); Serial.print(velocitySettings.velocityMax);
+  Serial.print("  JMAX="); Serial.println(velocitySettings.jerkMaxForVelocity, 3);
+}
+
+void velocitySettingsSave() {
+  EEPROM.put(0, velocitySettings);
+  EEPROM.commit();
+  Serial.println("[cfg] Saved to EEPROM.");
+}
+
+void velocitySettingsLoad() {
+  EEPROM.begin(sizeof(VelocitySettings));
+  VelocitySettings loaded;
+  EEPROM.get(0, loaded);
+  if (velocitySettingsValid(loaded)) {
+    velocitySettings = loaded;
+    Serial.println("[cfg] Loaded velocity settings from EEPROM.");
+  } else {
+    Serial.println("[cfg] No valid saved settings; using defaults.");
+  }
+}
+
+// Impact jerk -> MIDI velocity, linearly mapped and clamped to the
+// configured [velocityMin, velocityMax] range.
+uint8_t jerkToVelocity(float jerk) {
+  float lo = COLLISION_JERK_THRESHOLD;
+  float hi = velocitySettings.jerkMaxForVelocity;
+  float t  = (hi > lo) ? (jerk - lo) / (hi - lo) : 1.0f;
+  t = constrain(t, 0.0f, 1.0f);
+  int v = velocitySettings.velocityMin +
+          lroundf(t * (velocitySettings.velocityMax - velocitySettings.velocityMin));
+  return (uint8_t)constrain(v, 1, 127);
+}
+
+void processSerialCommand(String line) {
+  line.trim();
+  int sp = line.indexOf(' ');
+  String name = (sp < 0) ? line : line.substring(0, sp);
+  String arg  = (sp < 0) ? ""   : line.substring(sp + 1);
+  name.toUpperCase();
+  arg.trim();
+
+  if (name == "SHOW") {
+    velocitySettingsPrint();
+  } else if (name == "VMIN") {
+    int v = arg.toInt();
+    if (v < 1 || v > 127 || v > velocitySettings.velocityMax) {
+      Serial.println("[cfg] VMIN must be 1-127 and <= VMAX.");
+      return;
+    }
+    velocitySettings.velocityMin = (uint8_t)v;
+    velocitySettingsSave();
+    velocitySettingsPrint();
+  } else if (name == "VMAX") {
+    int v = arg.toInt();
+    if (v < 1 || v > 127 || v < velocitySettings.velocityMin) {
+      Serial.println("[cfg] VMAX must be 1-127 and >= VMIN.");
+      return;
+    }
+    velocitySettings.velocityMax = (uint8_t)v;
+    velocitySettingsSave();
+    velocitySettingsPrint();
+  } else if (name == "JMAX") {
+    float v = arg.toFloat();
+    if (!(v > COLLISION_JERK_THRESHOLD)) {
+      Serial.print("[cfg] JMAX must be greater than the jerk threshold (");
+      Serial.print(COLLISION_JERK_THRESHOLD, 3);
+      Serial.println(").");
+      return;
+    }
+    velocitySettings.jerkMaxForVelocity = v;
+    velocitySettingsSave();
+    velocitySettingsPrint();
+  } else if (name == "RESET") {
+    velocitySettings = VELOCITY_SETTINGS_DEFAULT;
+    velocitySettingsSave();
+    velocitySettingsPrint();
+  } else if (name == "HELP") {
+    Serial.println("Commands: VMIN <1-127>  VMAX <1-127>  JMAX <float>  SHOW  RESET  HELP");
+  } else if (name.length() > 0) {
+    Serial.print("[cfg] Unknown command: "); Serial.println(name);
+  }
+}
+
+// Accumulates Serial input into newline-terminated commands for
+// processSerialCommand(), replacing the old unconditional input drain.
+void handleSerialCommands() {
+  static String lineBuf;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (lineBuf.length() > 0) {
+        processSerialCommand(lineBuf);
+        lineBuf = "";
+      }
+    } else if (lineBuf.length() < 64) {
+      lineBuf += c;
+    }
+  }
+}
+
 // Sampled ~every IMU_SAMPLE_INTERVAL_MS via millis() instead of delay(), so
 // the matrix/light render every loop and keep up with rapid notes.
 void updateImuCollision(unsigned long now) {
@@ -256,9 +392,11 @@ void updateImuCollision(unsigned long now) {
   if (collision) {
     lastCollisionMs = now;   // render step below shows the crash flash window
     if (!midiNotePlaying && bleConnected) {
-      midiNoteOn(MIDI_CHANNEL, MIDI_NOTE, MIDI_VELOCITY);
+      uint8_t velocity = jerkToVelocity(jerk);
+      midiNoteOn(MIDI_CHANNEL, MIDI_NOTE, velocity);
       midiNotePlaying = true;
-      Serial.print("COLLISION DETECTED  jerk="); Serial.println(jerk, 3);
+      Serial.print("COLLISION DETECTED  jerk="); Serial.print(jerk, 3);
+      Serial.print("  velocity="); Serial.println(velocity);
     }
   } else if (midiNotePlaying) {
     midiNoteOff(MIDI_CHANNEL, MIDI_NOTE, 0);
@@ -302,11 +440,15 @@ void setup() {
 
   bleBegin();   // BLE-MIDI endpoint, fires a note on jerk/crash
 
+  velocitySettingsLoad();
+  velocitySettingsPrint();
+  Serial.println("Commands: VMIN <1-127>  VMAX <1-127>  JMAX <float>  SHOW  RESET  HELP");
+
   Serial.println("Jerk/crash-triggered MIDI running.");
 }
 
 void loop() {
-  while (Serial.available()) Serial.read();   // drain unused serial input
+  handleSerialCommands();        // VMIN/VMAX/JMAX/SHOW/RESET velocity config
 
   updateBleStatus();             // show green/red BLE link status
 
