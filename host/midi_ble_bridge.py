@@ -37,6 +37,8 @@ Usage:
 
 import argparse
 import asyncio
+import json
+import os
 import queue
 import sys
 import threading
@@ -49,12 +51,32 @@ from bleak import BleakClient, BleakScanner
 DEVICE_NAME = "AccelLight"
 MIDI_SERVICE_UUID = "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
 MIDI_CHAR_UUID = "7772e5db-3868-4112-a1a9-f2669d106bf3"
+CRASH_NOTE = 36  # C1 - matches MIDI_NOTE in main.cpp, fired on jerk/crash detection
 
 # GUI status window (set in main() if enabled) and the shared stop signal.
 # BLE work runs on a background thread; Tkinter owns the main thread. Both
 # sides only touch _ui through its thread-safe setters.
 _ui = None
 _stop_event = threading.Event()
+
+# Guards midiout across the BLE thread (send_message) and the GUI thread
+# (restart button closing/reopening the port).
+_midi_lock = threading.Lock()
+
+# Written on every status change so other processes (e.g. the Ableton launch
+# script waiting for the BLE link to come up) can poll connection state
+# without needing their own BLE stack.
+STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge_status.json")
+
+
+def _set_status(state: str, text: str, detail: str = "") -> None:
+    try:
+        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"state": state, "text": text, "detail": detail, "ts": time.time()}, f)
+    except OSError as e:
+        print(f"[status] Could not write {STATUS_FILE}: {e}", file=sys.stderr)
+    if _ui is not None:
+        _ui.set_status(state, text, detail)
 
 
 def _midi_data_len(status: int) -> int:
@@ -176,21 +198,22 @@ class StatusWindow:
 
     MAX_LOG_LINES = 200
 
-    def __init__(self, stop_event: threading.Event):
+    def __init__(self, stop_event: threading.Event, on_restart=None):
         import tkinter as tk
         from tkinter import ttk
 
         self.stop_event = stop_event
+        self.on_restart = on_restart  # set after the MIDI port is opened; see main()
         self._queue: "queue.Queue" = queue.Queue()
         self._forwarded = 0
 
         self.root = tk.Tk()
         self.root.title("AccelLight - MIDI Bridge")
-        self.root.geometry("460x340")
-        self.root.minsize(380, 240)
+        self.root.geometry("460x370")
+        self.root.minsize(380, 270)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(4, weight=1)
+        self.root.rowconfigure(5, weight=1)
 
         self.canvas = tk.Canvas(self.root, width=28, height=28, highlightthickness=0)
         self.dot = self.canvas.create_oval(2, 2, 26, 26, fill=self.COLORS["scanning"], outline="")
@@ -208,12 +231,16 @@ class StatusWindow:
         ttk.Label(self.root, textvariable=self.port_var, wraplength=420, justify="left").grid(
             row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 0))
 
+        self.restart_btn = ttk.Button(
+            self.root, text="Restart MIDI Port", command=self._on_restart_click)
+        self.restart_btn.grid(row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
+
         self.count_var = tk.StringVar(value="MIDI messages forwarded: 0")
         ttk.Label(self.root, textvariable=self.count_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4))
+            row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4))
 
         log_frame = ttk.Frame(self.root)
-        log_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 16))
+        log_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 16))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -229,6 +256,21 @@ class StatusWindow:
     def _on_close(self):
         self.stop_event.set()
         self.root.destroy()
+
+    def _on_restart_click(self):
+        if self.on_restart is None:
+            return
+        self.restart_btn.configure(state="disabled")
+        self._append_log(f"{time.strftime('%H:%M:%S')}  Restarting MIDI port...")
+        # Defer past this event so the log line above actually paints before
+        # the (brief but blocking) close/reopen call runs.
+        self.root.after(50, self._do_restart)
+
+    def _do_restart(self):
+        try:
+            self.on_restart()
+        finally:
+            self.restart_btn.configure(state="normal")
 
     def _poll(self):
         try:
@@ -311,15 +353,58 @@ def open_midi_out(port_name: str) -> rtmidi.MidiOut:
         raise SystemExit(1)
 
 
+def restart_midi_port(midiout: rtmidi.MidiOut, port_name: str) -> None:
+    """Close and reopen the MIDI output port.
+
+    Ableton only scans MIDI devices at launch (or when the MIDI preferences
+    pane reopens), so a loopMIDI port that appears/changes after that stays
+    invisible to it even though other apps (which poll more eagerly) see it
+    fine. Toggling the port off and on re-announces it at the OS level,
+    which is often enough to get Ableton to pick it up on its next rescan
+    without restarting Ableton itself.
+    """
+    with _midi_lock:
+        print("[midi] Restarting MIDI port...")
+        try:
+            midiout.close_port()
+        except Exception as e:
+            print(f"[midi] close_port failed: {e}", file=sys.stderr)
+        time.sleep(0.3)
+
+        ports = midiout.get_ports()
+        match = next((i for i, p in enumerate(ports) if port_name.lower() in p.lower()), None)
+        try:
+            if match is not None:
+                midiout.open_port(match)
+                print(f"[midi] Reopened port: {ports[match]}")
+                if _ui is not None:
+                    _ui.set_port(ports[match])
+            else:
+                midiout.open_virtual_port(port_name)
+                print(f"[midi] Recreated virtual port: {port_name}")
+                if _ui is not None:
+                    _ui.set_port(port_name)
+        except (NotImplementedError, RuntimeError) as e:
+            print(f"[midi] Failed to reopen MIDI port: {e}", file=sys.stderr)
+            if _ui is not None:
+                _ui.set_port(f"(error reopening: {e})")
+
+
 def midi_notification_handler(midiout: rtmidi.MidiOut):
     def handler(_sender, data: bytearray):
+        print(f"[ble] Notification received ({len(data)} bytes)")
         for msg in parse_ble_midi(bytes(data)):
-            midiout.send_message(msg)
+            with _midi_lock:
+                midiout.send_message(msg)
             msg_hex = " ".join(f"{b:02X}" for b in msg)
             line = f"{time.strftime('%H:%M:%S')}  {describe_midi_message(msg):<34} [{msg_hex}]"
             print(f"[midi] {line}")
             if _ui is not None:
                 _ui.note_forwarded(line)
+
+            if len(msg) == 3 and (msg[0] & 0xF0) == 0x90 and msg[1] == CRASH_NOTE and msg[2] > 0:
+                print(f"[crash] CRASH DETECTED at {time.strftime('%H:%M:%S')} (velocity {msg[2]})")
+                _set_status("connected", "Crash detected!", f"note {CRASH_NOTE} vel {msg[2]}")
     return handler
 
 
@@ -330,9 +415,8 @@ async def find_device(timeout: float):
         attempt += 1
         suffix = "" if attempt == 1 else f" (attempt {attempt})"
         print(f"[ble] Scanning for '{DEVICE_NAME}'{suffix} (timeout={timeout}s)...")
-        if _ui is not None:
-            _ui.set_status("scanning", "Searching for ESP32...",
-                            f"Attempt {attempt} — looking for '{DEVICE_NAME}'")
+        _set_status("scanning", "Searching for ESP32...",
+                     f"Attempt {attempt} — looking for '{DEVICE_NAME}'")
 
         dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=timeout)
         if dev is None:
@@ -344,14 +428,12 @@ async def find_device(timeout: float):
 
         if dev:
             print(f"[ble] Found device: {dev.name}  address={dev.address}")
-            if _ui is not None:
-                _ui.set_status("connecting", "Device found, connecting...",
-                                f"{dev.name or DEVICE_NAME} @ {dev.address}")
+            _set_status("connecting", "Device found, connecting...",
+                         f"{dev.name or DEVICE_NAME} @ {dev.address}")
             return dev
 
         print(f"[ble] No device found after {timeout}s. Retrying...")
-        if _ui is not None:
-            _ui.set_status("disconnected", "ESP32 not found", "Retrying — is the board powered on?")
+        _set_status("disconnected", "ESP32 not found", "Retrying — is the board powered on?")
 
     return None
 
@@ -369,8 +451,7 @@ async def watch_connection(args, midiout: rtmidi.MidiOut):
             async with BleakClient(dev) as client:
                 await client.start_notify(MIDI_CHAR_UUID, handler)
                 print(f"Connected to {dev.address}. Forwarding MIDI to '{args.port_name}'.")
-                if _ui is not None:
-                    _ui.set_status("connected", "Connected", dev.address)
+                _set_status("connected", "Connected", dev.address)
                 while client.is_connected and not _stop_event.is_set():
                     await asyncio.sleep(0.5)
         except Exception as e:
@@ -378,8 +459,7 @@ async def watch_connection(args, midiout: rtmidi.MidiOut):
 
         if not _stop_event.is_set():
             print("[ble] Disconnected. Reconnecting...")
-            if _ui is not None:
-                _ui.set_status("disconnected", "Disconnected", "Reconnecting...")
+            _set_status("disconnected", "Disconnected", "Reconnecting...")
     return 0
 
 
@@ -399,6 +479,8 @@ def main():
             print(name)
         return
 
+    _set_status("starting", "Bridge starting...", "")
+
     global _ui
 
     if not args.no_gui:
@@ -411,13 +493,15 @@ def main():
 
     midiout = open_midi_out(args.port_name)
 
+    if _ui is not None:
+        _ui.on_restart = lambda: restart_midi_port(midiout, args.port_name)
+
     def run_backend():
         try:
             asyncio.run(watch_connection(args, midiout))
         except Exception as e:
             print(f"[fatal] {e}", file=sys.stderr)
-            if _ui is not None:
-                _ui.set_status("error", "Fatal error", str(e))
+            _set_status("error", "Fatal error", str(e))
         finally:
             _stop_event.set()
 

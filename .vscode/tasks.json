@@ -43,10 +43,10 @@
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
     {
-      "label": "🎹 Run MIDI Status UI",
+      "label": "🎹 Run MIDI Bridge",
       "type": "shell",
       "command": "uv",
-      "args": ["run", "${workspaceFolder}/host/midi_status_ui.py"],
+      "args": ["run", "${workspaceFolder}/host/midi_ble_bridge.py"],
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
