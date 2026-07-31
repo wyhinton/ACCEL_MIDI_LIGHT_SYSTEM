@@ -16,6 +16,17 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "📟 Monitor Sender",
+      "type": "shell",
+      "command": "pio",
+      "windows": {
+        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
+      },
+      "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/ACCELERATION_LIGHT_SENDER_REAL", "--baud", "115200"],
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
+    },
+    {
       "label": "🎧 Run Audio Bridge",
       "type": "shell",
       "command": "uv",

@@ -226,7 +226,7 @@ QMI8658_Data imuData;
 const unsigned long IMU_SAMPLE_INTERVAL_MS = 80;    // throttle IMU reads
 const float          COLLISION_JERK_THRESHOLD = 1.0f;   // g/frame – lower = more sensitive
 const float          MIN_MOVING_MAG           = 1.3f;   // previous frame must exceed this
-const unsigned long  COLLISION_COOLDOWN_MS    = 600;    // ms before re-triggering
+const unsigned long  COLLISION_COOLDOWN_MS    = 200;    // ms before re-triggering
 const unsigned long  COLLISION_FLASH_MS       = 120;    // visual flash window
 
 float         prevAccelMag   = 1.0f;
