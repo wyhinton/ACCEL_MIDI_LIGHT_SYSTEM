@@ -287,8 +287,9 @@ void setup() {
   // pulsing) so the BLE status pixel stays legible even when the pulse dims.
   matrix.setBrightness(MATRIX_MAX_BRIGHTNESS);
 
-  // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
-  pulse.begin(0, 255, 600, 2500);
+  // Pulse intensity, easing over 0.6–2.5 s segments. Ceiling kept low so the
+  // idle ambient glow stays dim; the collision flash still jumps to full 255.
+  pulse.begin(0, 25, 600, 2500);
 
   // IMU: SDA=11, SCL=12 (Seeed XIAO ESP32-S3)
   if (!imu.begin(11, 12)) {
