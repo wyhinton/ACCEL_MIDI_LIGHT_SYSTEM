@@ -1,4 +1,2 @@
 bleak>=0.22
-sounddevice>=0.4.6
-numpy>=1.24
-pyaudiowpatch>=0.2.12.7; sys_platform == "win32"
+python-rtmidi>=1.5

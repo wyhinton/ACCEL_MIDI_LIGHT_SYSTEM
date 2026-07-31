@@ -4,7 +4,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Upload to Sender",
+      "label": "📤 Upload to Sender",
       "type": "shell",
       "command": "pio",
       "windows": {
@@ -16,7 +16,7 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "Run Audio Bridge",
+      "label": "🎧 Run Audio Bridge",
       "type": "shell",
       "command": "uv",
       "args": ["run", "${workspaceFolder}/host/audio_bridge.py", "--device", "${input:audioDevice}"],
@@ -24,7 +24,7 @@
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
     {
-      "label": "Run Audio Bridge (Windows Loopback)",
+      "label": "🔁 Run Audio Bridge (Windows Loopback)",
       "type": "shell",
       "command": "uv",
       "args": ["run", "${workspaceFolder}/host/audio_bridge.py", "--loopback", "--device", "${input:loopbackDevice}"],
@@ -32,14 +32,22 @@
       "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
     },
     {
-      "label": "Git Pull",
+      "label": "🎹 Run MIDI Status UI",
+      "type": "shell",
+      "command": "uv",
+      "args": ["run", "${workspaceFolder}/host/midi_status_ui.py"],
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true, "reveal": "always" }
+    },
+    {
+      "label": "⬇️ Git Pull",
       "type": "shell",
       "command": "git pull",
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
-      "label": "Quick Commit & Push",
+      "label": "🚀 Quick Commit & Push",
       "type": "shell",
       "command": "git add -A && git commit -m '${input:commitMessage}' && git push",
       "windows": {
