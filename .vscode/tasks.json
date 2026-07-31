@@ -1,0 +1,81 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Upload: Acceleration Light Sender",
+            "type": "shell",
+            "command": "pio",
+            "args": [
+                "run",
+                "-t",
+                "upload",
+                "-e",
+                "esp32-s3-devkitc-1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/ACCELERATION_LIGHT_SENDER_REAL"
+            },
+            "group": "build",
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "Upload: Acceleration Light Receiver",
+            "type": "shell",
+            "command": "pio",
+            "args": [
+                "run",
+                "-t",
+                "upload",
+                "-e",
+                "seeed_xiao_esp32s3"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/ACCLERATION_LIGHT_RECIEVER_REAL"
+            },
+            "group": "build",
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "Upload: MIDI Note Light",
+            "type": "shell",
+            "command": "pio",
+            "args": [
+                "run",
+                "-t",
+                "upload",
+                "-e",
+                "seeed_xiao_esp32s3"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"
+            },
+            "group": "build",
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "Upload: All Firmware",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Upload: Acceleration Light Sender",
+                "Upload: Acceleration Light Receiver",
+                "Upload: MIDI Note Light"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}
