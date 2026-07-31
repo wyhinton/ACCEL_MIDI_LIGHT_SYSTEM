@@ -49,6 +49,7 @@ from bleak import BleakClient, BleakScanner
 DEVICE_NAME = "AccelLight"
 MIDI_SERVICE_UUID = "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
 MIDI_CHAR_UUID = "7772e5db-3868-4112-a1a9-f2669d106bf3"
+CRASH_NOTE = 36  # C1 - matches MIDI_NOTE in main.cpp, fired on jerk/crash detection
 
 # GUI status window (set in main() if enabled) and the shared stop signal.
 # BLE work runs on a background thread; Tkinter owns the main thread. Both
@@ -313,6 +314,7 @@ def open_midi_out(port_name: str) -> rtmidi.MidiOut:
 
 def midi_notification_handler(midiout: rtmidi.MidiOut):
     def handler(_sender, data: bytearray):
+        print(f"[ble] Notification received ({len(data)} bytes)")
         for msg in parse_ble_midi(bytes(data)):
             midiout.send_message(msg)
             msg_hex = " ".join(f"{b:02X}" for b in msg)
@@ -320,6 +322,11 @@ def midi_notification_handler(midiout: rtmidi.MidiOut):
             print(f"[midi] {line}")
             if _ui is not None:
                 _ui.note_forwarded(line)
+
+            if len(msg) == 3 and (msg[0] & 0xF0) == 0x90 and msg[1] == CRASH_NOTE and msg[2] > 0:
+                print(f"[crash] CRASH DETECTED at {time.strftime('%H:%M:%S')} (velocity {msg[2]})")
+                if _ui is not None:
+                    _ui.set_status("connected", "Crash detected!", f"note {CRASH_NOTE} vel {msg[2]}")
     return handler
 
 
