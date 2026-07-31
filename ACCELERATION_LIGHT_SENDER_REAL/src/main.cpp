@@ -1,10 +1,16 @@
 /*
-  Soft Random – SENDER (ESP32-S3 RGB LED Matrix, Waveshare)
+  Jerk/Crash-triggered MIDI – SENDER (ESP32-S3 RGB LED Matrix, Waveshare)
 
-  Standalone board: no ESP-NOW, no other ESP32s. The 8×8 RGB matrix and the
-  PWM light on GPIO 2 pulse smoothly and randomly (brightness eases between
-  random targets over random durations), scaled by a live audio level
-  streamed directly from a PC over BLE (see AUDIO_BRIDGE.md).
+  Reads acceleration from a QMI8658 IMU. A sudden jerk (impact/crash) fires a
+  MIDI Note On over BLE-MIDI (the standard Bluetooth-SIG GATT profile), so
+  any BLE-MIDI-capable host (Windows Bluetooth LE MIDI, a DAW, etc.) sees it
+  as a normal MIDI input once paired — no companion app needed to receive
+  notes.
+
+  The 8x8 RGB matrix and the PWM light on GPIO 2 glow with a smooth,
+  randomly-wandering idle pulse, boosted by a brief flash on every detected
+  impact. A single corner pixel shows live BLE connection status; all pixels
+  flash green the instant a BLE-MIDI host connects.
 */
 
 #include <Arduino.h>
@@ -14,70 +20,82 @@
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 
+#include <QMI8658.h>   // by Lahav Gahali
+
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <BLE2902.h>
 
-// -------- AUDIO LEVEL BLE BRIDGE (PC -> here, direct) --------
-// A host (e.g. a Mac/PC app, see host/audio_bridge.py) connects over BLE and
-// writes a single byte — the smoothed level of its outgoing audio (0..255) —
-// to the characteristic below, at ~30-60 Hz. If none arrive for a while we
-// fall back to full brightness so the lights never go dark with no PC
-// connected.
-#define AUDIO_SERVICE_UUID "9a0b0000-1234-4c6e-9b00-1f2e3d4c5b6a"
-#define AUDIO_CHAR_UUID    "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
+// -------- BLE-MIDI (standard Bluetooth-SIG GATT profile) --------
+// Hand-rolled with the raw BLE APIs (rather than a MIDI library) so it's a
+// single, self-contained BLE identity/server. Packet format per the
+// Bluetooth-SIG "MIDI over Bluetooth Low Energy" spec: a header byte, a
+// timestamp byte, then the raw MIDI status/data bytes, sent as a
+// characteristic notification.
+#define MIDI_SERVICE_UUID "03B80E5A-EDE8-4B33-A751-6CE34EC4C700"
+#define MIDI_CHAR_UUID    "7772E5DB-3868-4112-A1A9-F2669D106BF3"
 
-const unsigned long LEVEL_TIMEOUT_MS      = 1500;  // no level this long => full bright
+const uint8_t MIDI_NOTE     = 36;   // C1
+const uint8_t MIDI_VELOCITY = 127;
+const uint8_t MIDI_CHANNEL  = 0;    // 0-indexed (MIDI channel 1)
 
-volatile uint8_t       audioLevelRaw = 255;   // last level received (set in BLE write cb)
-volatile unsigned long lastLevelMs   = 0;      // when it arrived
-float                  audioLevelSmoothed = 255.0f;  // on-device EMA (bridges gaps)
+BLECharacteristic *midiChar = nullptr;
 
-volatile bool bleConnected  = false;   // a BLE client (the PC) is connected
-bool          bleWasUp      = false;   // debounced, for the connect burst
+volatile bool bleConnected = false;   // a BLE-MIDI host is connected
+bool          bleWasUp     = false;   // debounced, for the connect burst
 
-class LevelWriteCallback : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *c) override {
-    uint8_t *data = c->getData();
-    size_t   len  = c->getValue().length();
-    if (data && len >= 1) {
-      audioLevelRaw = data[0];
-      lastLevelMs   = millis();
-    }
-  }
-};
-
-// Re-arm advertising after a disconnect (otherwise the host can't reconnect
+// Re-arm advertising after a disconnect (otherwise a host can't reconnect
 // without a reboot).
 class BridgeServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override    { bleConnected = true; }
   void onDisconnect(BLEServer *s) override { bleConnected = false; BLEDevice::startAdvertising(); }
 };
 
+// Pack and send one MIDI message as a BLE-MIDI notification.
+void sendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2) {
+  if (midiChar == nullptr) return;
+  uint16_t t = (uint16_t)(millis() & 0x1FFF);   // 13-bit BLE-MIDI timestamp
+  uint8_t packet[5] = {
+    (uint8_t)(0x80 | ((t >> 7) & 0x3F)),        // header byte
+    (uint8_t)(0x80 | (t & 0x7F)),               // timestamp byte
+    status, data1, data2,
+  };
+  midiChar->setValue(packet, 5);
+  midiChar->notify();
+}
+
+void midiNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
+  sendMidiMessage(0x90 | (channel & 0x0F), note & 0x7F, velocity & 0x7F);
+}
+
+void midiNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
+  sendMidiMessage(0x80 | (channel & 0x0F), note & 0x7F, velocity & 0x7F);
+}
+
 void bleBegin() {
-  BLEDevice::init("LightAudioBridge");
+  BLEDevice::init("AccelLight");
   BLEServer  *server = BLEDevice::createServer();
   server->setCallbacks(new BridgeServerCallbacks());
-  BLEService *svc    = server->createService(AUDIO_SERVICE_UUID);
+  BLEService *svc    = server->createService(MIDI_SERVICE_UUID);
 
-  // Write-without-response so the host can stream at audio rate without
-  // waiting for an ACK per packet.
-  BLECharacteristic *ch = svc->createCharacteristic(
-      AUDIO_CHAR_UUID,
-      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
-  ch->setCallbacks(new LevelWriteCallback());
+  midiChar = svc->createCharacteristic(
+      MIDI_CHAR_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY);
+  midiChar->addDescriptor(new BLE2902());   // required for the host to enable notifications
 
   svc->start();
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(AUDIO_SERVICE_UUID);
+  adv->addServiceUUID(MIDI_SERVICE_UUID);
   adv->setScanResponse(false);
   BLEDevice::startAdvertising();
 
-  Serial.println("BLE audio bridge advertising as 'LightAudioBridge'");
+  Serial.println("BLE-MIDI advertising as 'AccelLight'");
 }
 
-// -------- SMOOTH RANDOM PULSE --------
+// -------- SMOOTH RANDOM PULSE (idle ambient animation) --------
 // Brightness wanders smoothly and randomly: ease from the current level toward
 // a new random target over a random duration, then pick another. smoothstep
 // easing keeps the motion gentle, with no hard corners.
@@ -186,18 +204,65 @@ void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
   matrix.show();
 }
 
-// BLE link status: a full-matrix green burst the instant the PC connects;
+// BLE link status: a full-matrix green burst the instant a host connects;
 // otherwise a single corner pixel tracks live status every frame (see
 // STATUS_PIXEL_X/Y in the render step of loop()).
 void updateBleStatus() {
   if (bleConnected && !bleWasUp) {
     bleWasUp = true;
-    Serial.println("BLE LINK UP (PC connected)");
-    blinkMatrix(0, 255, 0, 4, 150, 120);   // green: PC connected
+    Serial.println("BLE LINK UP (host connected)");
+    blinkMatrix(0, 255, 0, 4, 150, 120);   // green: host connected
     matrix.setBrightness(MATRIX_MAX_BRIGHTNESS);   // blinkMatrix leaves brightness at 120
   } else if (!bleConnected && bleWasUp) {
     bleWasUp = false;
-    Serial.println("BLE LINK DOWN (PC disconnected)");
+    Serial.println("BLE LINK DOWN (host disconnected)");
+  }
+}
+
+// -------- IMU / JERK-CRASH DETECTION --------
+QMI8658      imu;
+QMI8658_Data imuData;
+
+const unsigned long IMU_SAMPLE_INTERVAL_MS = 80;    // throttle IMU reads
+const float          COLLISION_JERK_THRESHOLD = 1.0f;   // g/frame – lower = more sensitive
+const float          MIN_MOVING_MAG           = 1.3f;   // previous frame must exceed this
+const unsigned long  COLLISION_COOLDOWN_MS    = 600;    // ms before re-triggering
+const unsigned long  COLLISION_FLASH_MS       = 120;    // visual flash window
+
+float         prevAccelMag   = 1.0f;
+unsigned long lastCollisionMs = 0;
+bool          midiNotePlaying = false;
+
+// Sampled ~every IMU_SAMPLE_INTERVAL_MS via millis() instead of delay(), so
+// the matrix/light render every loop and keep up with rapid notes.
+void updateImuCollision(unsigned long now) {
+  static unsigned long lastSampleMs = 0;
+  if (now - lastSampleMs < IMU_SAMPLE_INTERVAL_MS) return;
+  lastSampleMs = now;
+
+  if (!imu.readSensorData(imuData)) return;
+
+  float ax_g = imuData.accelX / 1000.0f;
+  float ay_g = imuData.accelY / 1000.0f;
+  float az_g = imuData.accelZ / 1000.0f;
+  float accelMag = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+
+  float jerk = fabs(accelMag - prevAccelMag);
+  bool collision = (jerk > COLLISION_JERK_THRESHOLD)
+                && (prevAccelMag > MIN_MOVING_MAG)
+                && ((now - lastCollisionMs) > COLLISION_COOLDOWN_MS);
+  prevAccelMag = accelMag;
+
+  if (collision) {
+    lastCollisionMs = now;   // render step below shows the crash flash window
+    if (!midiNotePlaying && bleConnected) {
+      midiNoteOn(MIDI_CHANNEL, MIDI_NOTE, MIDI_VELOCITY);
+      midiNotePlaying = true;
+      Serial.print("COLLISION DETECTED  jerk="); Serial.println(jerk, 3);
+    }
+  } else if (midiNotePlaying) {
+    midiNoteOff(MIDI_CHANNEL, MIDI_NOTE, 0);
+    midiNotePlaying = false;
   }
 }
 
@@ -225,9 +290,19 @@ void setup() {
   // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
   pulse.begin(0, 255, 600, 2500);
 
-  bleBegin();   // BLE endpoint for the PC's streamed audio level
+  // IMU: SDA=11, SCL=12 (Seeed XIAO ESP32-S3)
+  if (!imu.begin(11, 12)) {
+    Serial.println("Failed to initialize QMI8658!");
+    while (1) { delay(1000); }
+  }
+  imu.setAccelUnit_mg(true);
+  imu.setGyroUnit_dps(true);
+  imu.setDisplayPrecision(4);
+  Serial.println("QMI8658 initialized.");
 
-  Serial.println("Soft random pulse running.");
+  bleBegin();   // BLE-MIDI endpoint, fires a note on jerk/crash
+
+  Serial.println("Jerk/crash-triggered MIDI running.");
 }
 
 void loop() {
@@ -237,26 +312,24 @@ void loop() {
 
   unsigned long now = millis();
 
-  // ---- AUDIO-LEVEL MULTIPLIER ----
-  // Track the PC's streamed level with a light EMA so dropped packets don't
-  // cause flicker; fall back to full brightness if the stream goes silent.
-  uint8_t levelTarget = (lastLevelMs != 0 && now - lastLevelMs < LEVEL_TIMEOUT_MS)
-                          ? audioLevelRaw : 255;
-  audioLevelSmoothed += ((float)levelTarget - audioLevelSmoothed) * 0.2f;
-  float audioMul = audioLevelSmoothed / 255.0f;   // 0..1
+  updateImuCollision(now);       // sample IMU, fire MIDI note on/off
 
-  // ---- SMOOTH RANDOM PULSE (base layer), scaled by the audio level ----
-  uint8_t pulseVal = (uint8_t)(pulse.value(now) * audioMul);      // 0..255
+  // ---- SMOOTH RANDOM PULSE (idle ambient layer) ----
+  uint8_t pulseVal = pulse.value(now);
+
+  // ---- COLLISION FLASH, layered on top of the pulse ----
+  uint8_t flashVal = (lastCollisionMs != 0 && (now - lastCollisionMs) < COLLISION_FLASH_MS)
+                       ? 255 : 0;
+  uint8_t shown = (flashVal > pulseVal) ? flashVal : pulseVal;
 
   // ---- RENDER MATRIX (every loop) ----
-  // Brightness is held fixed (set once in setup()); the pulse itself scales
-  // the pixel color instead, so the status pixel below stays at full
-  // strength even when the pulse dims toward 0.
-  matrix.fillScreen(matrix.Color(pulseVal, pulseVal, pulseVal));
+  // Brightness is held fixed (set once in setup()); the pulse/flash scale the
+  // pixel color instead, so the status pixel below stays at full strength.
+  matrix.fillScreen(matrix.Color(shown, shown, shown));
   matrix.drawPixel(STATUS_PIXEL_X, STATUS_PIXEL_Y,
                     bleConnected ? matrix.Color(0, 255, 0) : matrix.Color(255, 0, 0));
   matrix.show();
 
   // ---- PWM LIGHT ----
-  lightWriteDuty(pulseVal);
+  lightWriteDuty(shown);
 }
