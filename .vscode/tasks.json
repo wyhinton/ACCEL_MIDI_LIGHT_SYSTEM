@@ -1,6 +1,6 @@
 {
-  // PlatformIO upload tasks, one per board. Run via Terminal > Run Task...
-  // Each builds and flashes the firmware for that project directory.
+  // PlatformIO upload task for the sender board, plus the host audio bridge
+  // and git helpers. Run via Terminal > Run Task...
   "version": "2.0.0",
   "tasks": [
     {
@@ -11,30 +11,6 @@
         "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
       },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCELERATION_LIGHT_SENDER_REAL"],
-      "problemMatcher": "$platformio",
-      "group": "build",
-      "presentation": { "panel": "dedicated", "clear": true }
-    },
-    {
-      "label": "Upload to Receiver",
-      "type": "shell",
-      "command": "pio",
-      "windows": {
-        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
-      },
-      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/ACCLERATION_LIGHT_RECIEVER_REAL"],
-      "problemMatcher": "$platformio",
-      "group": "build",
-      "presentation": { "panel": "dedicated", "clear": true }
-    },
-    {
-      "label": "Upload to Midi Light",
-      "type": "shell",
-      "command": "pio",
-      "windows": {
-        "command": "${env:USERPROFILE}/.platformio/penv/Scripts/pio.exe"
-      },
-      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
       "presentation": { "panel": "dedicated", "clear": true }

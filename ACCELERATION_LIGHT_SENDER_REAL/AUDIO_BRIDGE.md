@@ -7,16 +7,16 @@ layered on top of the smooth random pulse — it does not replace it.
 ## Data path
 
 ```
-Mac app                     MIDI board (BLE bridge)        Light boards
---------                    -----------------------        ------------
-capture system audio   BLE   LightAudioBridge        ESP-NOW   sender + receiver
-  -> RMS envelope    ──────▶ write char (1 byte)   ─────────▶ LevelMessage{cmd,level}
-  -> smooth 0..255            rebroadcast in loop()           -> audioMul = level/255
-                                                              -> brightness *= audioMul
+Mac app                                    SENDER light board
+--------                                   -------------------
+capture system audio   BLE                  LightAudioBridge
+  -> RMS envelope    ──────────────────▶    write char (1 byte)
+  -> smooth 0..255                          -> audioMul = level/255
+                                             -> brightness *= audioMul
 ```
 
-A Mac cannot emit ESP-NOW frames, so it speaks BLE to the MIDI board, which
-rebroadcasts over the existing ESP-NOW mesh.
+The Mac speaks BLE directly to the SENDER board — no other ESP32s (MIDI board,
+receiver) are involved in this path.
 
 ## BLE contract (what the firmware exposes)
 

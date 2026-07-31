@@ -1,10 +1,10 @@
 /*
   Soft Random – SENDER (ESP32-S3 RGB LED Matrix, Waveshare)
 
-  Crash/IMU detection has been removed. This board now just glows: the 8×8 RGB
-  matrix and the PWM light on GPIO 2 pulse smoothly and randomly (brightness
-  eases between random targets over random durations). MIDI-triggered flashes
-  from the MIDI board (over ESP-NOW) still pop ON TOP of the pulse.
+  Standalone board: no ESP-NOW, no other ESP32s. The 8×8 RGB matrix and the
+  PWM light on GPIO 2 pulse smoothly and randomly (brightness eases between
+  random targets over random durations), scaled by a live audio level
+  streamed directly from a PC over BLE (see AUDIO_BRIDGE.md).
 */
 
 #include <Arduino.h>
@@ -14,154 +14,69 @@
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 
-#include <WiFi.h>
-#include <esp_now.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 
-// -------- ESP-NOW PEER --------
-// Broadcast: any ESP32 running an ESP-NOW peer on the same WiFi channel hears
-// us. To target one board, replace with its STA MAC.
-uint8_t espNowPeerMac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+// -------- AUDIO LEVEL BLE BRIDGE (PC -> here, direct) --------
+// A host (e.g. a Mac/PC app, see host/audio_bridge.py) connects over BLE and
+// writes a single byte — the smoothed level of its outgoing audio (0..255) —
+// to the characteristic below, at ~30-60 Hz. If none arrive for a while we
+// fall back to full brightness so the lights never go dark with no PC
+// connected.
+#define AUDIO_SERVICE_UUID "9a0b0000-1234-4c6e-9b00-1f2e3d4c5b6a"
+#define AUDIO_CHAR_UUID    "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
 
-bool espNowReady = false;
+const unsigned long LEVEL_TIMEOUT_MS      = 1500;  // no level this long => full bright
+const unsigned long RED_BLINK_INTERVAL_MS = 3000;  // how often to warn when disconnected
 
-// -------- HANDSHAKE / LINK STATUS --------
-// The sender beacons HELLO; the receiver replies ACK. Distinguished from the
-// FlashCommand by length (1 byte vs 5 bytes).
-enum HandshakeType { HS_HELLO = 1, HS_ACK = 2 };
-typedef struct __attribute__((packed)) {
-  uint8_t type;
-} HandshakeMessage;
-
-// -------- FLASH COMMAND (from the MIDI board) --------
-// Velocity-scaled flash request broadcast by MIDI_NOTE_LIGHT_REAL. We layer the
-// flash (at the given brightness) on top of the pulse for its duration.
-typedef struct __attribute__((packed)) {
-  uint8_t  cmd;         // = FLASH_CMD_MAGIC
-  uint8_t  velocity;    // original MIDI velocity 1..127 (for logging)
-  uint8_t  brightness;  // matrix brightness 0..255 (already scaled)
-  uint16_t durationMs;  // flash duration in ms (already scaled)
-} FlashCommand;
-#define FLASH_CMD_MAGIC 0xF1
-
-// -------- AUDIO LEVEL (from the Mac, via the MIDI board's BLE bridge) --------
-// 2-byte message carrying a smoothed output-audio level (0..255) that scales
-// the pulse/light brightness. Distinct from Handshake(1) and FlashCommand(5)
-// by length. If none arrive for a while we fall back to full brightness so the
-// lights never go dark with no Mac connected.
-typedef struct __attribute__((packed)) {
-  uint8_t cmd;    // = LEVEL_CMD_MAGIC
-  uint8_t level;  // 0..255
-} LevelMessage;
-#define LEVEL_CMD_MAGIC 0xA1
-
-const unsigned long LEVEL_TIMEOUT_MS = 1500;  // no level this long => full bright
-
-volatile uint8_t       audioLevelRaw = 255;   // last level received (set in recv cb)
+volatile uint8_t       audioLevelRaw = 255;   // last level received (set in BLE write cb)
 volatile unsigned long lastLevelMs   = 0;      // when it arrived
 float                  audioLevelSmoothed = 255.0f;  // on-device EMA (bridges gaps)
 
-// MIDI-triggered flash state (set in the recv callback, rendered in loop()).
-volatile bool          midiFlashActive     = false;
-volatile bool          newMidiFlash        = false;
-volatile unsigned long midiFlashStartMs    = 0;
-volatile unsigned long midiFlashDurationMs = 0;
-volatile uint8_t       midiFlashBrightness = 255;
-volatile uint8_t       midiFlashVelocity   = 0;
+volatile bool bleConnected  = false;   // a BLE client (the PC) is connected
+bool          bleWasUp      = false;   // debounced, for the connect burst
+unsigned long lastRedBlinkMs = 0;
 
-const unsigned long HELLO_INTERVAL_MS     = 1000;  // beacon period
-const unsigned long LINK_TIMEOUT_MS       = 3000;  // no ACK this long => link down
-const unsigned long RED_BLINK_INTERVAL_MS = 3000;  // how often to warn when down
-
-volatile unsigned long lastAckMs = 0;   // last ACK arrival (set in recv cb)
-bool          linkUp          = false;  // debounced link state
-unsigned long lastHelloSentMs = 0;
-unsigned long lastRedBlinkMs  = 0;
-
-// Send-status callback (optional, for debugging delivery).
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-void onEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-#else
-void onEspNowSent(const uint8_t *mac, esp_now_send_status_t status) {
-#endif
-  // Quiet by default; uncomment to debug delivery.
-  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "send OK" : "send FAIL");
-}
-
-// Receive callback: listen for ACKs (link status) and MIDI flash commands.
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-#else
-void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-#endif
-  if (len == sizeof(HandshakeMessage)) {
-    HandshakeMessage hs;
-    memcpy(&hs, data, sizeof(hs));
-    if (hs.type == HS_ACK) {
-      lastAckMs = millis();
+class LevelWriteCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    uint8_t *data = c->getData();
+    size_t   len  = c->getValue().length();
+    if (data && len >= 1) {
+      audioLevelRaw = data[0];
+      lastLevelMs   = millis();
     }
-    return;
   }
+};
 
-  // Audio level from the Mac (relayed by the MIDI board's BLE bridge).
-  if (len == sizeof(LevelMessage)) {
-    LevelMessage lm;
-    memcpy(&lm, data, sizeof(lm));
-    if (lm.cmd != LEVEL_CMD_MAGIC) return;
-    audioLevelRaw = lm.level;
-    lastLevelMs   = millis();
-    return;
-  }
+// Re-arm advertising after a disconnect (otherwise the host can't reconnect
+// without a reboot).
+class BridgeServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s) override    { bleConnected = true; }
+  void onDisconnect(BLEServer *s) override { bleConnected = false; BLEDevice::startAdvertising(); }
+};
 
-  // Velocity-scaled flash command from the MIDI board.
-  if (len == sizeof(FlashCommand)) {
-    FlashCommand fc;
-    memcpy(&fc, data, sizeof(fc));
-    if (fc.cmd != FLASH_CMD_MAGIC) return;
-    midiFlashBrightness = fc.brightness;
-    midiFlashDurationMs = fc.durationMs ? fc.durationMs : 100;
-    midiFlashVelocity   = fc.velocity;
-    midiFlashStartMs    = millis();
-    midiFlashActive     = true;
-    newMidiFlash        = true;
-    return;
-  }
-}
+void bleBegin() {
+  BLEDevice::init("LightAudioBridge");
+  BLEServer  *server = BLEDevice::createServer();
+  server->setCallbacks(new BridgeServerCallbacks());
+  BLEService *svc    = server->createService(AUDIO_SERVICE_UUID);
 
-void espNowBegin() {
-  // ESP-NOW runs on the WiFi radio. STA mode, no AP connection needed.
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  // Write-without-response so the host can stream at audio rate without
+  // waiting for an ACK per packet.
+  BLECharacteristic *ch = svc->createCharacteristic(
+      AUDIO_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ch->setCallbacks(new LevelWriteCallback());
 
-  Serial.print("This board STA MAC: ");
-  Serial.println(WiFi.macAddress());
+  svc->start();
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init FAILED");
-    return;
-  }
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(AUDIO_SERVICE_UUID);
+  adv->setScanResponse(false);
+  BLEDevice::startAdvertising();
 
-  esp_now_register_send_cb(onEspNowSent);
-  esp_now_register_recv_cb(onEspNowRecv);
-
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, espNowPeerMac, 6);
-  peer.channel = 0;       // use the current WiFi channel
-  peer.encrypt = false;
-
-  if (esp_now_add_peer(&peer) != ESP_OK) {
-    Serial.println("ESP-NOW add peer FAILED");
-    return;
-  }
-
-  espNowReady = true;
-  Serial.println("ESP-NOW ready (link + MIDI flash enabled)");
-}
-
-void espNowSendHello() {
-  if (!espNowReady) return;
-  HandshakeMessage hs;
-  hs.type = HS_HELLO;
-  esp_now_send(espNowPeerMac, (const uint8_t *)&hs, sizeof(hs));
+  Serial.println("BLE audio bridge advertising as 'LightAudioBridge'");
 }
 
 // -------- SMOOTH RANDOM PULSE --------
@@ -268,30 +183,23 @@ void showStartupLetter(char c, uint8_t r, uint8_t g, uint8_t b, int holdMs) {
   matrix.show();
 }
 
-// Beacon HELLO, watch for ACK, and show link status on the matrix:
-// a green burst the instant the link comes up, occasional red while it's down.
-void updateLinkStatus() {
+// Show BLE link status on the matrix: a green burst the instant the PC
+// connects, occasional red while no PC is connected.
+void updateBleStatus() {
   unsigned long now = millis();
 
-  if (now - lastHelloSentMs >= HELLO_INTERVAL_MS) {
-    lastHelloSentMs = now;
-    espNowSendHello();
-  }
-
-  bool connectedNow = (lastAckMs != 0) && (now - lastAckMs < LINK_TIMEOUT_MS);
-
-  if (connectedNow && !linkUp) {
-    linkUp = true;
-    Serial.println("LINK UP (ACK received)");
-    blinkMatrix(0, 255, 0, 4, 150, 120);   // green: handshake OK
-  } else if (!connectedNow) {
-    if (linkUp) {
-      linkUp = false;
-      Serial.println("LINK DOWN (no ACK)");
+  if (bleConnected && !bleWasUp) {
+    bleWasUp = true;
+    Serial.println("BLE LINK UP (PC connected)");
+    blinkMatrix(0, 255, 0, 4, 150, 120);   // green: PC connected
+  } else if (!bleConnected) {
+    if (bleWasUp) {
+      bleWasUp = false;
+      Serial.println("BLE LINK DOWN (PC disconnected)");
     }
     if (now - lastRedBlinkMs >= RED_BLINK_INTERVAL_MS) {
       lastRedBlinkMs = now;
-      blinkMatrix(255, 0, 0, 1, 150, 0);   // red: no link yet
+      blinkMatrix(255, 0, 0, 1, 150, 0);   // red: no PC yet
     }
   }
 }
@@ -300,7 +208,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // True-random seed so two boards don't pulse in lockstep.
+  // True-random seed so multiple boards don't pulse in lockstep.
   randomSeed(esp_random());
 
   lightBegin();   // PWM light, starts off
@@ -316,7 +224,7 @@ void setup() {
   // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
   pulse.begin(0, 255, 600, 2500);
 
-  espNowBegin();   // WiFi/ESP-NOW radio: link status + MIDI flash commands
+  bleBegin();   // BLE endpoint for the PC's streamed audio level
 
   Serial.println("Soft random pulse running.");
 }
@@ -324,34 +232,12 @@ void setup() {
 void loop() {
   while (Serial.available()) Serial.read();   // drain unused serial input
 
-  updateLinkStatus();           // beacon HELLO + show green/red link status
+  updateBleStatus();             // show green/red BLE link status
 
   unsigned long now = millis();
 
-  // ---- MIDI FLASH ENVELOPE (from the MIDI board over ESP-NOW) ----
-  // Decays linearly from the velocity-scaled peak back to 0 and is layered ON
-  // TOP of the pulse (brighter of the two wins), so a note pops above the glow
-  // and fades back into it. Recomputed every loop so quick notes retrigger.
-  uint8_t flashBoost = 0;
-  {
-    unsigned long since = now - midiFlashStartMs;
-    if (midiFlashActive && since < midiFlashDurationMs) {
-      float env = 1.0f - (float)since / (float)midiFlashDurationMs; // 1 -> 0
-      flashBoost = (uint8_t)(env * midiFlashBrightness);
-    } else {
-      midiFlashActive = false;
-    }
-  }
-  if (newMidiFlash) {
-    newMidiFlash = false;
-    Serial.print("MIDI FLASH  vel="); Serial.print(midiFlashVelocity);
-    Serial.print(" bright=");         Serial.print(midiFlashBrightness);
-    Serial.print(" dur=");            Serial.print(midiFlashDurationMs);
-    Serial.println("ms");
-  }
-
   // ---- AUDIO-LEVEL MULTIPLIER ----
-  // Track the Mac's streamed level with a light EMA so dropped packets don't
+  // Track the PC's streamed level with a light EMA so dropped packets don't
   // cause flicker; fall back to full brightness if the stream goes silent.
   uint8_t levelTarget = (lastLevelMs != 0 && now - lastLevelMs < LEVEL_TIMEOUT_MS)
                           ? audioLevelRaw : 255;
@@ -363,13 +249,10 @@ void loop() {
   uint8_t matrixBase = (uint8_t)((uint16_t)pulseVal * MATRIX_MAX_BRIGHTNESS / 255);
 
   // ---- RENDER MATRIX (every loop) ----
-  uint8_t shown = (flashBoost > matrixBase) ? flashBoost : matrixBase;
-  matrix.setBrightness(shown);
+  matrix.setBrightness(matrixBase);
   matrix.fillScreen(matrix.Color(255, 255, 255));
   matrix.show();
 
   // ---- PWM LIGHT ----
-  // Pulses with the random wave; a MIDI flash overrides upward when brighter.
-  uint8_t lightDuty = (flashBoost > pulseVal) ? flashBoost : pulseVal;
-  lightWriteDuty(lightDuty);
+  lightWriteDuty(pulseVal);
 }

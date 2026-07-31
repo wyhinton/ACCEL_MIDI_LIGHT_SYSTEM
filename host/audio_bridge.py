@@ -12,9 +12,8 @@
 Audio -> BLE bridge for the ACCEL/MIDI light system.
 
 Captures the level of an audio input device, smooths it into an envelope, and
-streams it (one byte, 0..255) over BLE to the MIDI board ("LightAudioBridge"),
-which rebroadcasts it over ESP-NOW so the light boards use it as a brightness
-multiplier.
+streams it (one byte, 0..255) over BLE directly to the SENDER light board
+("LightAudioBridge"), which uses it as a brightness multiplier on its pulse.
 
 macOS note: there's no clean way to grab *system output* audio from Python, so
 route your output through a virtual loopback device (BlackHole) and capture that
@@ -44,7 +43,7 @@ import numpy as np
 import sounddevice as sd
 from bleak import BleakClient, BleakScanner
 
-# Must match the firmware (MIDI_NOTE_LIGHT_REAL/src/main.cpp).
+# Must match the firmware (ACCELERATION_LIGHT_SENDER_REAL/src/main.cpp).
 DEVICE_NAME = "LightAudioBridge"
 SERVICE_UUID = "9a0b0000-1234-4c6e-9b00-1f2e3d4c5b6a"
 CHAR_UUID = "9a0b0001-1234-4c6e-9b00-1f2e3d4c5b6a"
