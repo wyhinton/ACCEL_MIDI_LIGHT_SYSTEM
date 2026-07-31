@@ -228,7 +228,8 @@ const unsigned long IMU_SAMPLE_INTERVAL_MS = 80;    // throttle IMU reads
 const float          COLLISION_JERK_THRESHOLD = 1.0f;   // g/frame – lower = more sensitive
 const float          MIN_MOVING_MAG           = 1.3f;   // previous frame must exceed this
 const unsigned long  COLLISION_COOLDOWN_MS    = 200;    // ms before re-triggering
-const unsigned long  COLLISION_FLASH_MS       = 120;    // visual flash window
+const unsigned long  COLLISION_FLASH_MS       = 120;    // hold at full brightness
+const unsigned long  COLLISION_FADE_MS        = 700;    // then ease out over this long
 
 float         prevAccelMag   = 1.0f;
 unsigned long lastCollisionMs = 0;
@@ -425,8 +426,9 @@ void setup() {
   // pulsing) so the BLE status pixel stays legible even when the pulse dims.
   matrix.setBrightness(MATRIX_MAX_BRIGHTNESS);
 
-  // Pulse 0..255 intensity, easing over 0.6–2.5 s segments.
-  pulse.begin(0, 255, 600, 2500);
+  // Pulse intensity, easing over 0.6–2.5 s segments. Ceiling kept low so the
+  // idle ambient glow stays dim; the collision flash still jumps to full 255.
+  pulse.begin(0, 25, 600, 2500);
 
   // IMU: SDA=11, SCL=12 (Seeed XIAO ESP32-S3)
   if (!imu.begin(11, 12)) {
@@ -460,8 +462,19 @@ void loop() {
   uint8_t pulseVal = pulse.value(now);
 
   // ---- COLLISION FLASH, layered on top of the pulse ----
-  uint8_t flashVal = (lastCollisionMs != 0 && (now - lastCollisionMs) < COLLISION_FLASH_MS)
-                       ? 255 : 0;
+  // Full brightness for COLLISION_FLASH_MS, then eases out to 0 over
+  // COLLISION_FADE_MS instead of cutting off instantly.
+  uint8_t flashVal = 0;
+  if (lastCollisionMs != 0) {
+    unsigned long elapsed = now - lastCollisionMs;
+    if (elapsed < COLLISION_FLASH_MS) {
+      flashVal = 255;
+    } else if (elapsed < COLLISION_FLASH_MS + COLLISION_FADE_MS) {
+      float t = (float)(elapsed - COLLISION_FLASH_MS) / (float)COLLISION_FADE_MS;  // 0..1
+      float e = 1.0f - t * t * (3.0f - 2.0f * t);                                  // smoothstep, inverted
+      flashVal = (uint8_t)(255.0f * e);
+    }
+  }
   uint8_t shown = (flashVal > pulseVal) ? flashVal : pulseVal;
 
   // ---- RENDER MATRIX (every loop) ----
