@@ -53,11 +53,28 @@ MIDI_SERVICE_UUID = "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
 MIDI_CHAR_UUID = "7772e5db-3868-4112-a1a9-f2669d106bf3"
 CRASH_NOTE = 36  # C1 - matches MIDI_NOTE in main.cpp, fired on jerk/crash detection
 
+# On every crash note, in addition to forwarding it, the bridge also sends a
+# CC message that ramps from 0 toward 127 over CC_RAMP_MAX_HITS collisions,
+# then wraps back to 0 and starts climbing again. CC20 is undefined in the
+# MIDI spec (safe to repurpose); this is bridge-side only, not sent by the
+# firmware.
+CC_RAMP_NUMBER = 20
+CC_RAMP_MAX_HITS = 30
+
 # GUI status window (set in main() if enabled) and the shared stop signal.
 # BLE work runs on a background thread; Tkinter owns the main thread. Both
 # sides only touch _ui through its thread-safe setters.
 _ui = None
 _stop_event = threading.Event()
+
+# Collisions counted toward the CC ramp. Only ever touched from the BLE
+# notification handler (bleak invokes it synchronously on the BLE thread's
+# event loop, never concurrently), so no lock is needed here.
+_collision_count = 0
+
+# Set by the GUI's "Reconnect Bluetooth" button; watch_connection() checks it
+# and, if set, tears down the current BLE connection and re-scans.
+_reconnect_event = threading.Event()
 
 # Guards midiout across the BLE thread (send_message) and the GUI thread
 # (restart button closing/reopening the port).
@@ -198,22 +215,24 @@ class StatusWindow:
 
     MAX_LOG_LINES = 200
 
-    def __init__(self, stop_event: threading.Event, on_restart=None):
+    def __init__(self, stop_event: threading.Event, on_restart=None, on_reconnect=None, on_reset_ramp=None):
         import tkinter as tk
         from tkinter import ttk
 
         self.stop_event = stop_event
         self.on_restart = on_restart  # set after the MIDI port is opened; see main()
+        self.on_reconnect = on_reconnect
+        self.on_reset_ramp = on_reset_ramp
         self._queue: "queue.Queue" = queue.Queue()
         self._forwarded = 0
 
         self.root = tk.Tk()
         self.root.title("AccelLight - MIDI Bridge")
-        self.root.geometry("460x370")
-        self.root.minsize(380, 270)
+        self.root.geometry("460x410")
+        self.root.minsize(380, 300)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(5, weight=1)
+        self.root.rowconfigure(7, weight=1)
 
         self.canvas = tk.Canvas(self.root, width=28, height=28, highlightthickness=0)
         self.dot = self.canvas.create_oval(2, 2, 26, 26, fill=self.COLORS["scanning"], outline="")
@@ -231,16 +250,34 @@ class StatusWindow:
         ttk.Label(self.root, textvariable=self.port_var, wraplength=420, justify="left").grid(
             row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 0))
 
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.grid(row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
+
         self.restart_btn = ttk.Button(
-            self.root, text="Restart MIDI Port", command=self._on_restart_click)
-        self.restart_btn.grid(row=3, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
+            btn_frame, text="Restart MIDI Port", command=self._on_restart_click)
+        self.restart_btn.grid(row=0, column=0)
+
+        self.reconnect_btn = ttk.Button(
+            btn_frame, text="Reconnect Bluetooth", command=self._on_reconnect_click)
+        self.reconnect_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self.reset_ramp_btn = ttk.Button(
+            btn_frame, text="Reset Ramp", command=self._on_reset_ramp_click)
+        self.reset_ramp_btn.grid(row=0, column=2, padx=(8, 0))
 
         self.count_var = tk.StringVar(value="MIDI messages forwarded: 0")
         ttk.Label(self.root, textvariable=self.count_var).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 4))
 
+        self.ramp_var = tk.StringVar(
+            value=f"Crash ramp (CC{CC_RAMP_NUMBER}): 0/127  (0/{CC_RAMP_MAX_HITS} hits)")
+        ttk.Label(self.root, textvariable=self.ramp_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 2))
+        self.ramp_bar = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", maximum=127)
+        self.ramp_bar.grid(row=6, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 8))
+
         log_frame = ttk.Frame(self.root)
-        log_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 16))
+        log_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 16))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
@@ -272,6 +309,18 @@ class StatusWindow:
         finally:
             self.restart_btn.configure(state="normal")
 
+    def _on_reconnect_click(self):
+        if self.on_reconnect is None:
+            return
+        self._append_log(f"{time.strftime('%H:%M:%S')}  Reconnect requested by user.")
+        self.on_reconnect()
+
+    def _on_reset_ramp_click(self):
+        if self.on_reset_ramp is None:
+            return
+        self._append_log(f"{time.strftime('%H:%M:%S')}  Ramp reset by user.")
+        self.on_reset_ramp()
+
     def _poll(self):
         try:
             while True:
@@ -287,6 +336,11 @@ class StatusWindow:
                     self._forwarded += 1
                     self.count_var.set(f"MIDI messages forwarded: {self._forwarded}")
                     self._append_log(payload)
+                elif kind == "ramp":
+                    hits, max_hits, value = payload
+                    self.ramp_var.set(
+                        f"Crash ramp (CC{CC_RAMP_NUMBER}): {value}/127  ({hits}/{max_hits} hits)")
+                    self.ramp_bar["value"] = value
         except queue.Empty:
             pass
         if not self.stop_event.is_set():
@@ -304,6 +358,9 @@ class StatusWindow:
 
     def set_status(self, state: str, text: str, detail: str = ""):
         self._queue.put(("status", (state, text, detail)))
+
+    def set_ramp(self, hits: int, max_hits: int, value: int):
+        self._queue.put(("ramp", (hits, max_hits, value)))
 
     def set_port(self, name: str):
         self._queue.put(("port", name))
@@ -390,6 +447,18 @@ def restart_midi_port(midiout: rtmidi.MidiOut, port_name: str) -> None:
                 _ui.set_port(f"(error reopening: {e})")
 
 
+def reset_collision_ramp(midiout: rtmidi.MidiOut) -> None:
+    """Zero the crash-ramp counter and send CC=0 (e.g. via the GUI's "Reset Ramp" button)."""
+    global _collision_count
+    _collision_count = 0
+    cc_msg = (0xB0, CC_RAMP_NUMBER, 0)
+    with _midi_lock:
+        midiout.send_message(cc_msg)
+    print(f"[midi] Ramp reset -> CC{CC_RAMP_NUMBER} = 0")
+    if _ui is not None:
+        _ui.set_ramp(0, CC_RAMP_MAX_HITS, 0)
+
+
 def midi_notification_handler(midiout: rtmidi.MidiOut):
     def handler(_sender, data: bytearray):
         print(f"[ble] Notification received ({len(data)} bytes)")
@@ -405,6 +474,22 @@ def midi_notification_handler(midiout: rtmidi.MidiOut):
             if len(msg) == 3 and (msg[0] & 0xF0) == 0x90 and msg[1] == CRASH_NOTE and msg[2] > 0:
                 print(f"[crash] CRASH DETECTED at {time.strftime('%H:%M:%S')} (velocity {msg[2]})")
                 _set_status("connected", "Crash detected!", f"note {CRASH_NOTE} vel {msg[2]}")
+
+                global _collision_count
+                _collision_count += 1
+                ramp_val = min(127, round(_collision_count * 127 / CC_RAMP_MAX_HITS))
+                cc_msg = (0xB0 | (msg[0] & 0x0F), CC_RAMP_NUMBER, ramp_val)
+                with _midi_lock:
+                    midiout.send_message(cc_msg)
+                cc_hex = " ".join(f"{b:02X}" for b in cc_msg)
+                cc_line = f"{time.strftime('%H:%M:%S')}  {describe_midi_message(cc_msg):<34} [{cc_hex}]"
+                print(f"[midi] {cc_line}")
+                if _ui is not None:
+                    _ui.note_forwarded(cc_line)
+                    _ui.set_ramp(_collision_count, CC_RAMP_MAX_HITS, ramp_val)
+
+                if _collision_count >= CC_RAMP_MAX_HITS:
+                    _collision_count = 0
     return handler
 
 
@@ -452,8 +537,12 @@ async def watch_connection(args, midiout: rtmidi.MidiOut):
                 await client.start_notify(MIDI_CHAR_UUID, handler)
                 print(f"Connected to {dev.address}. Forwarding MIDI to '{args.port_name}'.")
                 _set_status("connected", "Connected", dev.address)
-                while client.is_connected and not _stop_event.is_set():
+                while client.is_connected and not _stop_event.is_set() and not _reconnect_event.is_set():
                     await asyncio.sleep(0.5)
+                if _reconnect_event.is_set():
+                    _reconnect_event.clear()
+                    print("[ble] Manual reconnect requested. Disconnecting...")
+                    await client.disconnect()
         except Exception as e:
             print(f"[ble] Connection lost: {e}", file=sys.stderr)
 
@@ -485,7 +574,7 @@ def main():
 
     if not args.no_gui:
         try:
-            _ui = StatusWindow(_stop_event)
+            _ui = StatusWindow(_stop_event, on_reconnect=_reconnect_event.set)
         except Exception as e:
             print(f"[gui] Could not open status window ({e}); continuing without it.",
                   file=sys.stderr)
@@ -495,6 +584,7 @@ def main():
 
     if _ui is not None:
         _ui.on_restart = lambda: restart_midi_port(midiout, args.port_name)
+        _ui.on_reset_ramp = lambda: reset_collision_ramp(midiout)
 
     def run_backend():
         try:
