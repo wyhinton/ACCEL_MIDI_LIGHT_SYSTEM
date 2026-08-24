@@ -180,7 +180,7 @@ void onMidiFlash(uint8_t velocity);  // defined with the rest of that section
 static bool midiFlashActive = false; // declared here so every writer can check it
 static const unsigned long AUDIO_TIMEOUT_MS = 1000;
 static uint8_t audioLevel = 255;
-static uint8_t audioDepthPct = 100;
+static uint8_t audioDepthPct = 0;
 static bool audioActive = false;
 static unsigned long lastAudioRxMillis = 0;
 static uint8_t lastAppliedAudioScale = 255; // see updateAudio()
@@ -196,6 +196,15 @@ static const char *AUDIO_AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no passw
 static const uint16_t AUDIO_UDP_PORT = 7777;
 WiFiUDP audioUdp;
 static bool apActive = false; // set once in setupAudioWifi(); read by the status report
+
+// Art-Net (DMX-over-UDP, standard port 6454) rides the same SoftAP: QLC+
+// joins AUDIO_AP_SSID and sends ArtDMX packets addressed to this board's AP
+// IP (or broadcast to the AP subnet). Only DMX channel 1 is read for now --
+// its 0-255 value becomes the shared brightness for every relay, local and
+// extender alike (see onArtnetDmx()/pollArtnetUdp() below, applied the same
+// way as test-all mode / 't').
+static const uint16_t ARTNET_PORT = 6454;
+WiFiUDP artnetUdp;
 
 void onAudioLevel(uint8_t level) {
   audioLevel = level;
@@ -244,10 +253,14 @@ void setupAudioWifi() {
   WiFi.mode(WIFI_AP);
   apActive = WiFi.softAP(AUDIO_AP_SSID); // no password = open AP
   audioUdp.begin(AUDIO_UDP_PORT);
+  artnetUdp.begin(ARTNET_PORT);
   if (apActive) {
     Serial.printf("[AUDIO] SoftAP '%s' (open) up -- level frames to %s:%u/udp\n",
                   AUDIO_AP_SSID, WiFi.softAPIP().toString().c_str(),
                   (unsigned)AUDIO_UDP_PORT);
+    Serial.printf("[ARTNET] listening on :%u/udp -- point QLC+'s Art-Net output at %s (or broadcast)\n",
+                  (unsigned)ARTNET_PORT, WiFi.softAPIP().toString().c_str());
+    Serial.println("[ARTNET] once joined to the SoftAP; DMX channel 1 = shared relay brightness");
   } else {
     Serial.println("[AUDIO] SoftAP failed to start -- audio frames via USB serial only");
   }
@@ -449,6 +462,62 @@ static const uint8_t EFFECT_CHANNELS = 7;
 
 // duty[0..3] -> local pins in chase order, duty[4..6] -> extender 0-2
 static const uint8_t EFFECT_LOCAL_PINS[4] = {MOSFET_PIN_C, MOSFET_PIN_A, MOSFET_PIN_B, MOSFET_PIN_D};
+
+// ---- Art-Net DMX control ---------------------------------------------
+// A minimal ArtDMX receiver: any well-formed Art-Net packet's DMX channel 1
+// drives the shared relay brightness, the same path as test-all mode ('t')
+// -- so QLC+ (or any Art-Net console) gets a single dimmer channel that
+// fades every relay, local and extender, together. No universe filtering
+// yet: whichever Art-Net universe QLC+ is configured to send, channel 1 of
+// it is read. The first packet flips testAllMode on (mirroring the 't' key)
+// so the stream immediately takes over from the chase/effects/performance
+// mode; there's no timeout hand-back yet, so losing the Art-Net stream
+// leaves the relays holding their last commanded level.
+static bool artnetActive = false;
+static unsigned long lastArtnetRxMillis = 0;
+
+void onArtnetDmx(uint8_t level) {
+  lastArtnetRxMillis = millis();
+  if (!artnetActive) {
+    artnetActive = true;
+    Serial.println("[ARTNET] ArtDMX stream active -- channel 1 now drives shared brightness");
+  }
+  if (!testAllMode) {
+    testAllMode = true;
+    blackout = false;
+    effectsMode = false;
+    Serial.println("TEST_ALL = true (driven by Art-Net)");
+  }
+  testBrightness = (int)((uint32_t)level * PWM_MAX / 255);
+  applyTestAll();
+}
+
+// Art-Net packet layout (see the Art-Net 4 spec): 8-byte ID "Art-Net\0", a
+// 16-bit OpCode (little-endian), a 16-bit ProtVer (big-endian), then for
+// OpDmx (0x5000): Sequence, Physical, SubUni, Net, a 16-bit Length
+// (big-endian), then Length bytes of DMX data starting at channel 1. We
+// only need that first data byte, but still validate the header so a stray
+// UDP packet on this port can't be misread as a DMX frame.
+static const uint16_t ARTNET_OPCODE_DMX = 0x5000;
+static const size_t ARTNET_HEADER_LEN = 18; // through the two length bytes
+
+void pollArtnetUdp() {
+  while (artnetUdp.parsePacket() > 0) {
+    uint8_t buf[ARTNET_HEADER_LEN + 1]; // header + DMX channel 1
+    int len = artnetUdp.read(buf, sizeof(buf));
+    if (len < (int)sizeof(buf)) {
+      continue; // too short to be a DMX frame with at least one channel
+    }
+    if (memcmp(buf, "Art-Net", 7) != 0 || buf[7] != 0) {
+      continue; // not an Art-Net packet
+    }
+    uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);
+    if (opcode != ARTNET_OPCODE_DMX) {
+      continue; // ignore ArtPoll and everything else we don't need yet
+    }
+    onArtnetDmx(buf[ARTNET_HEADER_LEN]); // DMX channel 1
+  }
+}
 
 // Performance mode (ON at boot -- the board powers up already running it):
 // effects mode with an auto-switcher on top, hopping to a different randomly
@@ -1453,6 +1522,13 @@ void printConnectionStatus() {
     Serial.print(" | audio: none");
   }
 
+  if (artnetActive) {
+    formatAge(age, sizeof(age), lastArtnetRxMillis);
+    Serial.printf(" | artnet: active (brightness %d/%d, %s)", testBrightness, PWM_MAX, age);
+  } else {
+    Serial.print(" | artnet: none");
+  }
+
   if (midiSeen) {
     formatAge(age, sizeof(age), lastMidiRxMillis);
     Serial.printf(" | MIDI: last note %s%s", age, midiFlashEnabled ? "" : " (flash off)");
@@ -1470,6 +1546,7 @@ void delayWithSerial(unsigned long ms) {
   do {
     handleSerial();
     pollAudioUdp();
+    pollArtnetUdp();
     updateLinkStatus();
     printConnectionStatus();
     updateMidiFlash();

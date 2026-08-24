@@ -6,7 +6,7 @@
     {
       "label": "Upload to Multiplex",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -15,7 +15,7 @@
     {
       "label": "Upload & Monitor Multiplex",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -24,7 +24,7 @@
     {
       "label": "Monitor Multiplex",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -33,7 +33,7 @@
     {
       "label": "Upload to Extender",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -42,7 +42,7 @@
     {
       "label": "Upload & Monitor Extender",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -51,7 +51,7 @@
     {
       "label": "Upload to Midi Light",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -60,7 +60,7 @@
     {
       "label": "Upload & Monitor Midi Light",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -69,7 +69,7 @@
     {
       "label": "Monitor Midi Light",
       "type": "shell",
-      "command": "pio",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",

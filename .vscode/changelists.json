@@ -4,7 +4,7 @@
       "name": "Default",
       "files": [
         "MULTIPLEX_8266/src/main.cpp",
-        "MOSFET_EXTENDER_8266/src/main.cpp"
+        ".vscode/tasks.json"
       ]
     }
   ],
