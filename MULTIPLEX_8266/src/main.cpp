@@ -1,19 +1,26 @@
 // Pin map (primary board):
-//   GPIO0  (D3) - MOSFET channel C, chase step 1 (boot strapping pin, see MOSFET_PIN_C)
+//   GPIO0  (D3) - MOSFET channel C
 //   GPIO2  (D4) - onboard status LED, active-LOW (see STATUS_LED_PIN)
-//   GPIO4  (D2) - MOSFET channel A, chase step 2
-//   GPIO5  (D1) - MOSFET channel B, chase step 3
+//   GPIO4  (D2) - MOSFET channel A
+//   GPIO5  (D1) - MOSFET channel B
 //   GPIO12 (D6) - link RX from extender board
 //   GPIO14 (D5) - link TX to extender board
-//   GPIO15 (D8) - MOSFET channel D, chase step 4 (boot strapping pin, see MOSFET_PIN_D)
+//   GPIO15 (D8) - MOSFET channel D
 //
 // Pin map (extender board, see MOSFET_EXTENDER_8266):
-//   GPIO0  (D3) - MOSFET channel 2, chase step 7 (boot strapping pin)
+//   GPIO0  (D3) - MOSFET channel 2 (boot strapping pin)
 //   GPIO2  (D4) - onboard status LED, active-LOW
-//   GPIO4  (D2) - MOSFET channel 0, chase step 5
-//   GPIO5  (D1) - MOSFET channel 1, chase step 6
+//   GPIO4  (D2) - MOSFET channel 0
+//   GPIO5  (D1) - MOSFET channel 1
 //   GPIO12 (D6) - link RX from primary board
 //   GPIO14 (D5) - link TX to primary board
+//
+// Control: a 2-channel Art-Net (DMX-over-UDP) fixture -- channel 1 is the
+// shared brightness for all 7 relays (4 local + 3 on the extender), channel
+// 2 selects an animated pattern from effects.h (0 = no pattern, just a flat
+// fill at the channel-1 brightness). See ARTNET_CONTROL.md for how to point
+// QLC+ at the board. There is no serial control interface -- USB serial is
+// log output only.
 
 #include <Arduino.h>
 #include <EEPROM.h>
@@ -23,54 +30,13 @@
 
 #include "effects.h"
 
-// Serial key commands (see handleSerial()):
-//   0/1  active-HIGH (default) / active-LOW polarity
-//   2    toggle PWM fade-in vs instant switching, this board + the extender
-//   +/-  adjust fade duration (50ms per press, clamped 50-2000ms);
-//        in test-all mode adjusts the shared brightness instead, and in
-//        effects mode adjusts the effect fade-in time (1ms per press
-//        unshifted '='/'-', 10ms shifted '+'/'_')
-//   ./,  adjust the effects fade-out time (1ms per press, clamped
-//        0-2000ms, 0 = instant); shifted ('>'/'<') moves 10ms per press
-//   ]/[  adjust chase step length (50ms per press, clamped 1-1000ms);
-//        also sets the frame length in effects test mode
-//   b    toggle blackout (forces every channel off, including the extender's)
-//   t    toggle test-all mode (every channel on at a dim shared brightness)
-//   e    toggle effects test mode (QLC+ effect ports from effects.h across
-//        all 7 channels, each channel ramping per the effect fade-in/out
-//        times); while active, 'n'/'p' picks the next/previous effect
-//   r    toggle performance mode (ON at boot): effects mode runs and hops
-//        to a different random effect after each random 30-60s interval;
-//        'n'/'p' still picks manually and restarts the countdown
-//   m    calibrate the physical light order: each channel lights alone in
-//        turn and you type the lit lamp's position 1-7; once all seven are
-//        assigned the map is saved to EEPROM flash ('m' mid-run aborts)
-//   o/l  raise/lower the audio depth: how strongly the PC audio level
-//        stream (see the audio section below and AUDIO_LEVEL_BRIDGE/) dims
-//        the lights -- 10% per press, 0 = ignore audio, 100 = follow it fully
-//   g    toggle the MIDI note flash (on by default): [0xAF][velocity] frames
-//        from the MIDI_NOTE_LIGHT_REAL board flash every channel at a
-//        velocity-scaled brightness/duration, overlaid on the running mode
-//   j    simulate one MIDI Note On (fixed velocity) for testing without the
-//        MIDI_NOTE_LIGHT_REAL board attached -- also feeds the note-rate
-//        chase/effects tempo speedup (see effectiveChaseStepMs())
-//   Effects noise (see updateEffectNoise()) -- how deeply the per-channel
-//   wandering noise randomizes the effect, each its own 0-100% depth:
-//   a/z  raise/lower the brightness depth (lit channels shimmer dimmer)
-//   s/x  raise/lower the fade-in depth (each ramp-up scaled 0..2x)
-//   d/c  raise/lower the fade-out depth (same, for ramp-downs)
-//   f/v  slow down / speed up the noise itself (100ms per press,
-//        100-5000ms per new random sample)
-
-// GPIO4 (D2) and GPIO5 (D1) each drive a MOSFET switch module directly --
-// no more PCF8574 I2C expander / multiplexer. Part of a chase sequence, see
-// chaseStepMs / applyChaseStep() below.
+// GPIO4 (D2) and GPIO5 (D1) each drive a MOSFET switch module directly.
 static const uint8_t MOSFET_PIN_A = 4;
 static const uint8_t MOSFET_PIN_B = 5;
 
-// Third MOSFET channel, in phase with A (on/off together). GPIO0 is a boot
-// strapping pin (must read HIGH at power-on for normal boot), but that only
-// matters during reset -- driving it after setup() is safe.
+// Third MOSFET channel. GPIO0 is a boot strapping pin (must read HIGH at
+// power-on for normal boot), but that only matters during reset -- driving
+// it after setup() is safe.
 static const uint8_t MOSFET_PIN_C = 0; // D3
 
 // Fourth MOSFET channel. GPIO15 is also a boot strapping pin (must read LOW
@@ -79,33 +45,21 @@ static const uint8_t MOSFET_PIN_C = 0; // D3
 static const uint8_t MOSFET_PIN_D = 15; // D8
 
 // Link to a second ESP8266 ("extender" board, see MOSFET_EXTENDER_8266) that
-// drives three more MOSFET channels. Runs on SoftwareSerial (not the hardware
-// UART) so USB debug output and the '1'/'0' active-low toggle below keep
-// working over the USB cable. GPIO12/14 (D6/D5) are safe pins with no boot
-// strapping behavior. Wire crossed: this TX (D5) -> extender RX (D6), this
-// RX (D6) -> extender TX (D5), plus a shared GND between the two boards.
+// drives three more MOSFET channels. Runs on SoftwareSerial (not the
+// hardware UART) so USB debug output keeps working over the USB cable.
+// GPIO12/14 (D6/D5) are safe pins with no boot strapping behavior. Wire
+// crossed: this TX (D5) -> extender RX (D6), this RX (D6) -> extender TX
+// (D5), plus a shared GND between the two boards.
 static const uint8_t LINK_RX_PIN = 12; // D6
 static const uint8_t LINK_TX_PIN = 14; // D5
 static const uint32_t LINK_BAUD = 9600;
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN);
 
-// Frames sent to the extender board: [0xAA sync][cmd] for per-channel
-// on/off -- cmd bit0 = state (1=on, 0=off), bits1-2 = channel (0-2), bit3 =
-// fade mode (see fadeMode below) -- [0xAB sync][brightness 0-255] to drive
-// every extender channel to the same raw duty (test-all mode, see
-// applyTestAll()) -- or [0xAC sync][channel 0-2][duty 0-255] to set one
-// channel's raw duty (streamed by the effects fade engine, see
-// updateEffectFades()). The sync byte lets the extender resync after
-// noise/garbage instead of misreading a stray byte as a command.
-static const uint8_t LINK_SYNC_BYTE = 0xAA;
-static const uint8_t LINK_BRIGHTNESS_SYNC_BYTE = 0xAB;
+// [0xAC sync][channel 0-2][duty 0-255] sets one extender channel's raw duty
+// -- streamed continuously by the effects fade engine below as each channel
+// ramps. The sync byte lets the extender resync after noise/garbage instead
+// of misreading a stray byte as a command.
 static const uint8_t LINK_DUTY_SYNC_BYTE = 0xAC;
-
-void sendLinkCommand(uint8_t channel, bool on, bool fade) {
-  uint8_t cmd = (fade ? 0x8 : 0) | (channel << 1) | (on ? 1 : 0);
-  linkSerial.write(LINK_SYNC_BYTE);
-  linkSerial.write(cmd);
-}
 
 // The extender sends a heartbeat byte every ~250ms independent of command
 // traffic (see MOSFET_EXTENDER_8266). We don't care what arrives, only that
@@ -158,51 +112,35 @@ void updateLinkStatus() {
 // ---- PC audio level stream ------------------------------------------------
 // A helper script on the PC (see AUDIO_LEVEL_BRIDGE/) measures how loud the
 // audio going to a Windows output device is and streams it here as
-// [0xAD sync][level 0-255] frames -- interleaved with the key commands on the
-// USB serial (0xAD can't collide with any typed key), and/or wirelessly as
-// UDP packets to the SoftAP below. The level acts as a master brightness
-// scale multiplied into every mode's output (chase, effects, test-all, the
-// extender's channels included) at the point of write. audioDepthPct sets
-// how strongly: the scale interpolates between full brightness (depth 0%)
-// and the raw audio level (depth 100%). The stream is entirely optional --
-// after AUDIO_TIMEOUT_MS without a frame the scale snaps back to full, so
-// the board behaves exactly as before whenever the script isn't running.
-// [0xAE sync][percent] frames set audioDepthPct remotely (the script's
-// --depth flag); 'o'/'l' adjust it 10% per press at the terminal.
+// [0xAD sync][level 0-255] frames over UDP to the SoftAP below. The level
+// acts as a master brightness scale multiplied into every channel's output
+// (see scaleDuty(), used by the effects fade engine) at the point of write.
+// audioDepthPct sets how strongly: the scale interpolates between full
+// brightness (depth 0%) and the raw audio level (depth 100%). The stream is
+// entirely optional -- after AUDIO_TIMEOUT_MS without a frame the scale
+// snaps back to full, so the board behaves exactly as before whenever the
+// script isn't running. [0xAE sync][percent] frames set audioDepthPct
+// remotely (the script's --depth flag).
 static const uint8_t AUDIO_LEVEL_SYNC_BYTE = 0xAD;
 static const uint8_t AUDIO_DEPTH_SYNC_BYTE = 0xAE;
-
-// [0xAF sync][velocity 1-127] frames ride the same two transports (UDP to
-// the SoftAP, or interleaved on the USB serial): one per MIDI Note On, sent
-// by the MIDI_NOTE_LIGHT_REAL board. See the MIDI note flash section below.
-static const uint8_t MIDI_FLASH_SYNC_BYTE = 0xAF;
-void onMidiFlash(uint8_t velocity);  // defined with the rest of that section
-static bool midiFlashActive = false; // declared here so every writer can check it
 static const unsigned long AUDIO_TIMEOUT_MS = 1000;
 static uint8_t audioLevel = 255;
 static uint8_t audioDepthPct = 0;
 static bool audioActive = false;
 static unsigned long lastAudioRxMillis = 0;
-static uint8_t lastAppliedAudioScale = 255; // see updateAudio()
 
-// SoftAP the PC joins to send frames without the USB cable (which also
-// leaves the COM port free for a plain serial terminal). UDP rather than
-// TCP because the stream is fire-and-forget: a lost packet just means the
-// next one, ~16ms later, lands instead -- no reconnect logic to get stuck.
-// Note WiFi interrupts can jitter the 9600-baud SoftwareSerial link a
-// little; the sync-byte framing and the content-free heartbeat both
-// tolerate an occasional mangled byte.
-static const char *AUDIO_AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
+// SoftAP the PC (and QLC+) joins to send frames without a USB cable. UDP
+// rather than TCP because the audio stream is fire-and-forget: a lost
+// packet just means the next one, ~16ms later, lands instead -- no
+// reconnect logic to get stuck.
+static const char *AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
 static const uint16_t AUDIO_UDP_PORT = 7777;
 WiFiUDP audioUdp;
-static bool apActive = false; // set once in setupAudioWifi(); read by the status report
+static bool apActive = false; // set once in setupWifi(); read by the status report
 
 // Art-Net (DMX-over-UDP, standard port 6454) rides the same SoftAP: QLC+
-// joins AUDIO_AP_SSID and sends ArtDMX packets addressed to this board's AP
-// IP (or broadcast to the AP subnet). Only DMX channel 1 is read for now --
-// its 0-255 value becomes the shared brightness for every relay, local and
-// extender alike (see onArtnetDmx()/pollArtnetUdp() below, applied the same
-// way as test-all mode / 't').
+// joins AP_SSID and sends ArtDMX packets addressed to this board's AP IP
+// (or broadcast to the AP subnet). See the Art-Net section below.
 static const uint16_t ARTNET_PORT = 6454;
 WiFiUDP artnetUdp;
 
@@ -211,8 +149,7 @@ void onAudioLevel(uint8_t level) {
   lastAudioRxMillis = millis();
   if (!audioActive) {
     audioActive = true;
-    Serial.printf("[AUDIO] level stream active (depth %u%%, 'o'/'l' adjusts)\n",
-                  (unsigned)audioDepthPct);
+    Serial.printf("[AUDIO] level stream active (depth %u%%)\n", (unsigned)audioDepthPct);
   }
 }
 
@@ -229,10 +166,8 @@ void onAudioDepth(uint8_t pct) {
 void handleAudioFrame(uint8_t sync, uint8_t value) {
   if (sync == AUDIO_LEVEL_SYNC_BYTE) {
     onAudioLevel(value);
-  } else if (sync == AUDIO_DEPTH_SYNC_BYTE) {
-    onAudioDepth(value);
   } else {
-    onMidiFlash(value);
+    onAudioDepth(value);
   }
 }
 
@@ -248,21 +183,22 @@ uint16_t scaleDuty(uint16_t duty) {
   return (uint16_t)((uint32_t)duty * audioScale255() / 255);
 }
 
-void setupAudioWifi() {
+void setupWifi() {
   WiFi.persistent(false); // don't re-burn the same AP config to flash every boot
   WiFi.mode(WIFI_AP);
-  apActive = WiFi.softAP(AUDIO_AP_SSID); // no password = open AP
+  apActive = WiFi.softAP(AP_SSID); // no password = open AP
   audioUdp.begin(AUDIO_UDP_PORT);
   artnetUdp.begin(ARTNET_PORT);
   if (apActive) {
     Serial.printf("[AUDIO] SoftAP '%s' (open) up -- level frames to %s:%u/udp\n",
-                  AUDIO_AP_SSID, WiFi.softAPIP().toString().c_str(),
-                  (unsigned)AUDIO_UDP_PORT);
+                  AP_SSID, WiFi.softAPIP().toString().c_str(), (unsigned)AUDIO_UDP_PORT);
     Serial.printf("[ARTNET] listening on :%u/udp -- point QLC+'s Art-Net output at %s (or broadcast)\n",
                   (unsigned)ARTNET_PORT, WiFi.softAPIP().toString().c_str());
-    Serial.println("[ARTNET] once joined to the SoftAP; DMX channel 1 = shared relay brightness");
+    Serial.println("[ARTNET] once joined to the SoftAP; channel 1 = brightness, channel 2 = pattern");
   } else {
-    Serial.println("[AUDIO] SoftAP failed to start -- audio frames via USB serial only");
+    // No serial control exists anymore -- if the AP fails to start, the
+    // board is unreachable until it's power-cycled.
+    Serial.println("[AUDIO/ARTNET] SoftAP failed to start -- board has no control path");
   }
 }
 
@@ -273,8 +209,7 @@ void pollAudioUdp() {
     uint8_t buf[64];
     int len = audioUdp.read(buf, sizeof(buf));
     for (int i = 0; i + 1 < len; i++) {
-      if (buf[i] == AUDIO_LEVEL_SYNC_BYTE || buf[i] == AUDIO_DEPTH_SYNC_BYTE ||
-          buf[i] == MIDI_FLASH_SYNC_BYTE) {
+      if (buf[i] == AUDIO_LEVEL_SYNC_BYTE || buf[i] == AUDIO_DEPTH_SYNC_BYTE) {
         handleAudioFrame(buf[i], buf[i + 1]);
         i++;
       }
@@ -299,10 +234,10 @@ void bootFlashStatusLed() {
 }
 
 // Bare GPIO driving MOSFET switch modules (not purpose-built active-low
-// relay boards), so the standard wiring is gate-driven-HIGH = ON.
-// Toggle live over serial instead of reflashing: send '1' for active-LOW,
-// '0' for active-HIGH (default).
-static bool activeLow = false;
+// relay boards), so the standard wiring is gate-driven-HIGH = ON. No serial
+// toggle anymore -- if the wiring ever needs active-LOW, flip this constant
+// and reflash.
+static const bool ACTIVE_LOW = false;
 
 // Routed through analogWrite (not digitalWrite) even for instant on/off, so
 // a pin that was mid-fade gets cleanly unregistered from the software PWM
@@ -313,250 +248,17 @@ static bool activeLow = false;
 // relying on the (255) default.
 static const int PWM_MAX = 1023;
 
-void setMosfet(uint8_t pin, bool on) {
-  // "on" is scaled by the audio master level (a mid-range duty is fine --
-  // it's just PWM); updateAudio() re-drives lit pins as the level moves.
-  uint16_t duty = on ? scaleDuty(PWM_MAX) : 0;
-  analogWrite(pin, activeLow ? PWM_MAX - duty : duty);
-}
-
-// Press '2' to toggle between the chase instantly switching each relay and
-// ramping it in with PWM instead. Applies to this board's local channels
-// and the extender's -- the fade bit rides along in every link command.
-static bool fadeMode = false;
-
-// When fadeMode is on, the pin that just turned "on" ramps 0 -> PWM_MAX
-// over fadeDurationMs, then holds at full for the rest of its chase step.
-// Only one local pin is ever "on" at a time in this chase, so only one fade
-// runs at once; turning a pin off cancels whatever fade was in progress.
-// Adjustable live over serial with '+'/'-' (see adjustFadeDuration()) so a
-// change takes effect immediately, even mid-ramp.
-static unsigned long fadeDurationMs = 250;
-static const unsigned long FADE_DURATION_STEP_MS = 50;
-static const unsigned long FADE_DURATION_MIN_MS = 50;
-static const unsigned long FADE_DURATION_MAX_MS = 2000;
-static uint8_t fadingPin = 255; // 255 = no fade in progress
-static unsigned long fadeStartMillis = 0;
-
-void beginFade(uint8_t pin) {
-  fadingPin = pin;
-  fadeStartMillis = millis();
-  analogWrite(pin, activeLow ? PWM_MAX : 0);
-}
-
-void cancelFade(uint8_t pin) {
-  if (fadingPin == pin) {
-    fadingPin = 255;
-  }
-}
-
-void updateFade() {
-  if (fadingPin == 255) {
-    return;
-  }
-  unsigned long elapsed = millis() - fadeStartMillis;
-  if (elapsed >= fadeDurationMs) {
-    uint16_t full = scaleDuty(PWM_MAX); // "full" under the audio master scale
-    analogWrite(fadingPin, activeLow ? PWM_MAX - full : full);
-    fadingPin = 255;
-    return;
-  }
-  // Scaling inside the every-tick ramp means a mid-fade lamp follows the
-  // audio level live, not just at the fade's endpoints.
-  int duty = (int)scaleDuty((uint16_t)((uint32_t)elapsed * PWM_MAX / fadeDurationMs));
-  analogWrite(fadingPin, activeLow ? (PWM_MAX - duty) : duty);
-}
-
-void adjustFadeDuration(long deltaMs) {
-  long updated = (long)fadeDurationMs + deltaMs;
-  if (updated < (long)FADE_DURATION_MIN_MS) {
-    updated = FADE_DURATION_MIN_MS;
-  } else if (updated > (long)FADE_DURATION_MAX_MS) {
-    updated = FADE_DURATION_MAX_MS;
-  }
-  fadeDurationMs = (unsigned long)updated;
-  Serial.printf("FADE_DURATION_MS = %lu\n", fadeDurationMs);
-}
-
-void applyLocalPin(uint8_t pin, bool on) {
-  if (on) {
-    if (fadeMode) {
-      beginFade(pin);
-    } else {
-      setMosfet(pin, true);
-    }
-  } else {
-    cancelFade(pin);
-    setMosfet(pin, false);
-  }
-}
-
-// Press 'b' to toggle a manual blackout: forces every channel off,
-// including the extender's, and holds the chase paused until pressed
-// again. Applied the instant the key is read (inside delayWithSerial's
-// ~10ms poll), not on the next chase step boundary, so it can't be stuck
-// waiting out whatever's mid-fade.
-static bool blackout = false;
-
-// The chase channel currently lit (0-6 as in effects mode, 255 = none), so
-// updateAudio() can keep re-driving a lamp that's statically on while the
-// audio level moves. Set by applyChaseStep(), cleared by applyBlackout().
-static uint8_t chaseLitChannel = 255;
-
-void applyBlackout() {
-  chaseLitChannel = 255;
-  applyLocalPin(MOSFET_PIN_C, false);
-  applyLocalPin(MOSFET_PIN_A, false);
-  applyLocalPin(MOSFET_PIN_B, false);
-  applyLocalPin(MOSFET_PIN_D, false);
-  sendLinkCommand(0, false, false);
-  sendLinkCommand(1, false, false);
-  sendLinkCommand(2, false, false);
-}
-
-// Press 't' to toggle a test-all mode: every channel on at once (including
-// the extender's, via the 0xAB brightness frame) at a dim starting
-// brightness, with '+'/'-' repurposed to raise/lower that shared brightness
-// while the mode is active. The chase pauses until 't' is pressed again.
-static bool testAllMode = false;
-static int testBrightness = 0;
-static const int TEST_BRIGHTNESS_INITIAL = 32;
-static const int TEST_BRIGHTNESS_STEP = 32;
-
-void sendLinkBrightness(int duty) {
-  linkSerial.write(LINK_BRIGHTNESS_SYNC_BYTE);
-  linkSerial.write((uint8_t)((long)duty * 255 / PWM_MAX));
-}
-
-void applyTestAll() {
-  fadingPin = 255; // direct duty writes below; don't let a stale fade fight them
-  int scaled = (int)scaleDuty((uint16_t)testBrightness);
-  int level = activeLow ? PWM_MAX - scaled : scaled;
-  analogWrite(MOSFET_PIN_C, level);
-  analogWrite(MOSFET_PIN_A, level);
-  analogWrite(MOSFET_PIN_B, level);
-  analogWrite(MOSFET_PIN_D, level);
-  sendLinkBrightness(scaled);
-}
-
-void adjustTestBrightness(int delta) {
-  int updated = testBrightness + delta;
-  if (updated < 0) {
-    updated = 0;
-  } else if (updated > PWM_MAX) {
-    updated = PWM_MAX;
-  }
-  testBrightness = updated;
-  Serial.printf("TEST_BRIGHTNESS = %d / %d\n", testBrightness, PWM_MAX);
-  applyTestAll();
-}
-
-// Press 'e' to toggle effects test mode: runs the QLC+ script ports from
-// effects.h across all 7 channels (4 local + 3 extender) as a 7x1 strip,
-// one frame per chaseStepMs (']'/'[' adjusts as usual), with 'n'/'p'
-// selecting the next/previous effect. The chase pauses until 'e' again.
-static bool effectsMode = false;
-static uint8_t effectIndex = 0;
-static uint16_t effectStep = 0;
-static const uint8_t EFFECT_CHANNELS = 7;
-
-// duty[0..3] -> local pins in chase order, duty[4..6] -> extender 0-2
-static const uint8_t EFFECT_LOCAL_PINS[4] = {MOSFET_PIN_C, MOSFET_PIN_A, MOSFET_PIN_B, MOSFET_PIN_D};
-
-// ---- Art-Net DMX control ---------------------------------------------
-// A minimal ArtDMX receiver: any well-formed Art-Net packet's DMX channel 1
-// drives the shared relay brightness, the same path as test-all mode ('t')
-// -- so QLC+ (or any Art-Net console) gets a single dimmer channel that
-// fades every relay, local and extender, together. No universe filtering
-// yet: whichever Art-Net universe QLC+ is configured to send, channel 1 of
-// it is read. The first packet flips testAllMode on (mirroring the 't' key)
-// so the stream immediately takes over from the chase/effects/performance
-// mode; there's no timeout hand-back yet, so losing the Art-Net stream
-// leaves the relays holding their last commanded level.
-static bool artnetActive = false;
-static unsigned long lastArtnetRxMillis = 0;
-
-void onArtnetDmx(uint8_t level) {
-  lastArtnetRxMillis = millis();
-  if (!artnetActive) {
-    artnetActive = true;
-    Serial.println("[ARTNET] ArtDMX stream active -- channel 1 now drives shared brightness");
-  }
-  if (!testAllMode) {
-    testAllMode = true;
-    blackout = false;
-    effectsMode = false;
-    Serial.println("TEST_ALL = true (driven by Art-Net)");
-  }
-  testBrightness = (int)((uint32_t)level * PWM_MAX / 255);
-  applyTestAll();
-}
-
-// Art-Net packet layout (see the Art-Net 4 spec): 8-byte ID "Art-Net\0", a
-// 16-bit OpCode (little-endian), a 16-bit ProtVer (big-endian), then for
-// OpDmx (0x5000): Sequence, Physical, SubUni, Net, a 16-bit Length
-// (big-endian), then Length bytes of DMX data starting at channel 1. We
-// only need that first data byte, but still validate the header so a stray
-// UDP packet on this port can't be misread as a DMX frame.
-static const uint16_t ARTNET_OPCODE_DMX = 0x5000;
-static const size_t ARTNET_HEADER_LEN = 18; // through the two length bytes
-
-void pollArtnetUdp() {
-  while (artnetUdp.parsePacket() > 0) {
-    uint8_t buf[ARTNET_HEADER_LEN + 1]; // header + DMX channel 1
-    int len = artnetUdp.read(buf, sizeof(buf));
-    if (len < (int)sizeof(buf)) {
-      continue; // too short to be a DMX frame with at least one channel
-    }
-    if (memcmp(buf, "Art-Net", 7) != 0 || buf[7] != 0) {
-      continue; // not an Art-Net packet
-    }
-    uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);
-    if (opcode != ARTNET_OPCODE_DMX) {
-      continue; // ignore ArtPoll and everything else we don't need yet
-    }
-    onArtnetDmx(buf[ARTNET_HEADER_LEN]); // DMX channel 1
-  }
-}
-
-// Performance mode (ON at boot -- the board powers up already running it):
-// effects mode with an auto-switcher on top, hopping to a different randomly
-// chosen effect after each randomly rolled 30-60s interval. 'r' toggles the
-// auto-switching (turning it on also enters effects mode if needed); exiting
-// effects mode ('e'/'t'/'m') pauses the timer without clearing the flag, so
-// re-entering effects mode resumes the hopping.
-static bool performanceMode = true;
-static const unsigned long PERFORMANCE_SWITCH_MIN_MS = 30000;
-static const unsigned long PERFORMANCE_SWITCH_MAX_MS = 60000;
-static unsigned long performanceLastSwitchMillis = 0;
-static unsigned long performanceIntervalMs = PERFORMANCE_SWITCH_MIN_MS;
-
-// Ambient floor while performance mode runs: effects never dim below this,
-// and the MIDI note flash (see onMidiFlash()) adds its velocity-scaled boost
-// on top of it instead of on top of MIDI_FLASH_DUTY_MIN.
-static uint8_t performanceBaseBrightnessPct = 50;
-
-uint16_t performanceBaseDuty() {
-  return (uint16_t)((uint32_t)PWM_MAX * performanceBaseBrightnessPct / 100);
-}
-
-// Rolls a fresh random interval and restarts the countdown from now.
-void schedulePerformanceSwitch() {
-  performanceLastSwitchMillis = millis();
-  performanceIntervalMs =
-      (unsigned long)random(PERFORMANCE_SWITCH_MIN_MS, PERFORMANCE_SWITCH_MAX_MS + 1);
-}
-
 // ---- Physical light-order map -------------------------------------------
 // The lamps can be hung in any physical order, independent of which pin
 // drives them. channelPosition[ch] holds the physical position (0 = first
-// lamp in the row) of the lamp on channel ch, with channels indexed as in
-// effects mode: 0-3 = local pins C/A/B/D (EFFECT_LOCAL_PINS), 4-6 =
-// extender 0-2. Both order-aware consumers -- the chase and the effect
-// frames -- light physical positions and route through this map to reach
-// pins. Defaults to pin order; recalibrate live with the 'm' serial
-// command (below), which persists the result in the ESP8266's
-// EEPROM-emulated flash sector so it survives reboots and reflashes.
+// lamp in the row) of the lamp on channel ch, with channels indexed 0-3 =
+// local pins C/A/B/D (EFFECT_LOCAL_PINS), 4-6 = extender 0-2. Pattern frames
+// route through this map so they sweep down the physical row even when the
+// lamps aren't hung in pin order. There's no live recalibration anymore (it
+// was a serial-only flow) -- this just loads whatever order was last saved
+// to the EEPROM-emulated flash sector, defaulting to pin order if nothing
+// valid is stored there.
+static const uint8_t EFFECT_CHANNELS = 7;
 static uint8_t channelPosition[EFFECT_CHANNELS] = {0, 1, 2, 3, 4, 5, 6};
 
 static const char *CHANNEL_NAMES[EFFECT_CHANNELS] = {
@@ -598,7 +300,7 @@ void printChannelMap() {
 // A stored map only replaces the pin-order default if the magic, version,
 // and checksum all match AND the bytes form a permutation of 0-6 -- a
 // half-written or stale-layout sector falls back cleanly instead of
-// scrambling every mode's output.
+// scrambling every pattern's output.
 void loadChannelMap() {
   uint8_t stored[EFFECT_CHANNELS];
   bool valid = EEPROM.read(0) == MAP_MAGIC_0 && EEPROM.read(1) == MAP_MAGIC_1 &&
@@ -623,239 +325,36 @@ void loadChannelMap() {
     memcpy(channelPosition, stored, EFFECT_CHANNELS);
     Serial.println("[MAP] Loaded light order from EEPROM");
   } else {
-    Serial.println("[MAP] No saved light order; using pin order ('m' calibrates)");
+    Serial.println("[MAP] No saved light order; using pin order");
   }
   printChannelMap();
 }
 
-void saveChannelMap() {
-  EEPROM.write(0, MAP_MAGIC_0);
-  EEPROM.write(1, MAP_MAGIC_1);
-  EEPROM.write(2, MAP_VERSION);
-  for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
-    EEPROM.write(3 + i, channelPosition[i]);
-  }
-  EEPROM.write(3 + EFFECT_CHANNELS, channelMapChecksum(channelPosition));
-  if (EEPROM.commit()) {
-    Serial.println("[MAP] Light order saved to EEPROM");
-  } else {
-    Serial.println("[MAP] EEPROM commit FAILED -- order active this session but not persisted");
-  }
-}
+// duty[0..3] -> local pins in position order, duty[4..6] -> extender 0-2
+static const uint8_t EFFECT_LOCAL_PINS[4] = {MOSFET_PIN_C, MOSFET_PIN_A, MOSFET_PIN_B, MOSFET_PIN_D};
 
-// Press 'm' to calibrate: each channel lights alone in turn, and you type
-// the digit 1-7 of where the lit lamp sits in the physical row (1 = first
-// lamp). Assignments accumulate in calibrateAssign so an abort ('m' again)
-// keeps the previous map untouched; once all seven are assigned the new map
-// is adopted and saved. While active, calibration swallows every key (see
-// handleSerial) so the digits can't trip the polarity/fade toggles.
-static bool calibrateMode = false;
-static uint8_t calibrateChannel = 0;
-static uint8_t calibrateAssign[EFFECT_CHANNELS];
-
-void calibrateDrive(uint8_t channel, bool on) {
-  if (channel < 4) {
-    // Instant and at full duty on purpose -- ignores fadeMode and the audio
-    // master scale so the one lit lamp is unmistakable even mid-song.
-    bool level = activeLow ? !on : on;
-    analogWrite(EFFECT_LOCAL_PINS[channel], level ? PWM_MAX : 0);
-  } else {
-    sendLinkCommand(channel - 4, on, false);
-  }
-}
-
-void calibratePrompt() {
-  calibrateDrive(calibrateChannel, true);
-  Serial.printf("[MAP] Channel %u/%u (%s) is lit -- type its position 1-%u (1 = first lamp; 'm' aborts)\n",
-                (unsigned)(calibrateChannel + 1), (unsigned)EFFECT_CHANNELS,
-                CHANNEL_NAMES[calibrateChannel], (unsigned)EFFECT_CHANNELS);
-}
-
-void beginCalibrate() {
-  calibrateMode = true;
-  calibrateChannel = 0;
-  applyBlackout(); // known-dark so the one lit lamp is unambiguous
-  Serial.println("CALIBRATE = true");
-  calibratePrompt();
-}
-
-void endCalibrate(bool adopt) {
-  calibrateMode = false;
-  applyBlackout(); // everything off; the chase re-lights on its next step
-  if (adopt) {
-    memcpy(channelPosition, calibrateAssign, EFFECT_CHANNELS);
-    saveChannelMap();
-  } else {
-    Serial.println("[MAP] Calibration aborted; previous light order kept");
-  }
-  printChannelMap();
-}
-
-void handleCalibrateKey(char c) {
-  if (c == 'm') {
-    endCalibrate(false);
-    return;
-  }
-  if (c >= '1' && c < (char)('1' + EFFECT_CHANNELS)) {
-    uint8_t pos = (uint8_t)(c - '1');
-    for (uint8_t ch = 0; ch < calibrateChannel; ch++) {
-      if (calibrateAssign[ch] == pos) {
-        Serial.printf("[MAP] Position %c is already %s -- pick another\n", c, CHANNEL_NAMES[ch]);
-        return;
-      }
-    }
-    calibrateAssign[calibrateChannel] = pos;
-    Serial.printf("[MAP] %s -> position %c\n", CHANNEL_NAMES[calibrateChannel], c);
-    calibrateDrive(calibrateChannel, false);
-    calibrateChannel++;
-    if (calibrateChannel >= EFFECT_CHANNELS) {
-      endCalibrate(true);
-    } else {
-      calibratePrompt();
-    }
-    return;
-  }
-  if (c != '\r' && c != '\n' && c != '\t' && c != ' ' && c != 0) {
-    Serial.println("[MAP] (calibrating: digits 1-7 assign the lit lamp's position, 'm' aborts)");
-  }
-}
-
-// Per-channel fade engine for effects mode. Unlike the chase's single
-// fadingPin engine, every channel tracks its own ramp, so one frame can
-// fade several channels in and out at once. applyEffectFrame() sets
-// targets; updateEffectFades() walks each channel's duty toward its target
-// on every ~10ms delayWithSerial() tick. A channel that keeps the same
-// target across frames holds its level (or ramp) untouched. Fade-in and
-// fade-out times are adjustable live ('+'/'-' and '>'/'<' respectively
-// while in effects mode); 0 means snap instantly. The chase's fadeMode has
-// no effect here.
-static unsigned long effectFadeInMs = 250;
-static unsigned long effectFadeOutMs = 250;
-// Both fade times adjust in fine steps: 1ms unshifted ('='/'-' for fade-in,
-// '.'/',' for fade-out), 10ms shifted ('+'/'_' and '>'/'<') -- the shifted
-// characters are how "shift held" arrives over serial.
-static const long EFFECT_FADE_FINE_STEP_MS = 1;
-static const long EFFECT_FADE_COARSE_STEP_MS = 10;
-static const unsigned long EFFECT_FADE_MAX_MS = 2000;
+// ---- Per-channel fade engine ---------------------------------------------
+// Every channel tracks its own ramp toward a target duty, so brightness and
+// pattern changes fade smoothly instead of snapping. setEffectTarget() sets
+// a channel's target (a no-op if it's already there or already ramping
+// there); updateEffectFades() walks every channel's duty toward its target
+// on each ~10ms poll tick and writes it out -- locally via analogWrite,
+// extender channels streamed over the [0xAC][channel][duty] link frame.
+static const unsigned long EFFECT_FADE_IN_MS = 250;
+static const unsigned long EFFECT_FADE_OUT_MS = 250;
 
 struct EffectFade {
   uint16_t startDuty;   // duty when the current ramp began
   uint16_t targetDuty;  // duty the latest frame asked for
-  uint16_t currentDuty; // the ramp's current position (before noise)
+  uint16_t currentDuty; // the ramp's current position
   unsigned long startMillis;
   unsigned long durationMs;
 };
 static EffectFade effectFades[EFFECT_CHANNELS];
 
-// Time-evolving noise for effects mode: every channel follows its own
-// wandering random value -- a fresh sample every noisePeriodMs, smoothstep-
-// interpolated in between, so it drifts rather than jumps. Three depths say
-// how strongly that noise randomizes the effect, each individually 0-100%
-// (0 = off, the default):
-//   noiseBrightnessPct - lit channels are continuously dimmed by up to this
-//                        share of their level (a live shimmer)
-//   noiseFadeInPct     - each upward ramp's duration is scaled 0..2x by the
-//                        noise value sampled as the ramp starts
-//   noiseFadeOutPct    - same, for downward ramps
-// 'a'/'z', 's'/'x', 'd'/'c' raise/lower those in 10% steps; 'f'/'v' slows
-// down / speeds up the wandering itself (noisePeriodMs).
-static uint8_t noiseBrightnessPct = 0;
-static uint8_t noiseFadeInPct = 0;
-static uint8_t noiseFadeOutPct = 0;
-static const uint8_t NOISE_PCT_STEP = 10;
-static unsigned long noisePeriodMs = 500;
-static const unsigned long NOISE_PERIOD_STEP_MS = 100;
-static const unsigned long NOISE_PERIOD_MIN_MS = 100;
-static const unsigned long NOISE_PERIOD_MAX_MS = 5000;
-static uint8_t noisePrev[EFFECT_CHANNELS];
-static uint8_t noiseNext[EFFECT_CHANNELS];
-static unsigned long noiseSegment = 0;
-
-// Rolls the noise streams forward when a period boundary passes. If more
-// than one period went by (or noisePeriodMs just changed), resample both
-// ends instead of promoting a stale sample.
-void updateEffectNoise() {
-  unsigned long seg = millis() / noisePeriodMs;
-  if (seg == noiseSegment) {
-    return;
-  }
-  bool jumped = (seg != noiseSegment + 1);
+void initEffectFades() {
   for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
-    noisePrev[i] = jumped ? (uint8_t)random(256) : noiseNext[i];
-    noiseNext[i] = (uint8_t)random(256);
-  }
-  noiseSegment = seg;
-}
-
-// The channel's noise value right now, 0-255.
-uint8_t effectNoise(uint8_t channel) {
-  uint32_t frac = (millis() % noisePeriodMs) * 255 / noisePeriodMs; // 0-255
-  uint32_t s = frac * frac * (765 - 2 * frac) / 65025;              // smoothstep, 0-255
-  int32_t delta = (int32_t)noiseNext[channel] - (int32_t)noisePrev[channel];
-  return (uint8_t)((int32_t)noisePrev[channel] + delta * (int32_t)s / 255);
-}
-
-void adjustNoisePct(uint8_t *value, int delta, const char *label) {
-  int updated = (int)*value + delta;
-  if (updated < 0) {
-    updated = 0;
-  } else if (updated > 100) {
-    updated = 100;
-  }
-  *value = (uint8_t)updated;
-  Serial.printf("%s = %d%%\n", label, updated);
-}
-
-void adjustNoisePeriod(long deltaMs) {
-  long updated = (long)noisePeriodMs + deltaMs;
-  if (updated < (long)NOISE_PERIOD_MIN_MS) {
-    updated = NOISE_PERIOD_MIN_MS;
-  } else if (updated > (long)NOISE_PERIOD_MAX_MS) {
-    updated = NOISE_PERIOD_MAX_MS;
-  }
-  noisePeriodMs = (unsigned long)updated;
-  Serial.printf("NOISE_PERIOD_MS = %lu\n", noisePeriodMs);
-}
-
-// The extender's channels can't be PWM-addressed by the original link
-// frames (per-channel on/off or all-channels-same brightness only), so
-// fades stream over the [0xAC][channel][duty] frame instead -- throttled
-// and only-on-change, since a full 3-channel update is 9 bytes (~9ms of
-// blocking SoftwareSerial TX at 9600 baud) and fades tick every ~10ms.
-// The extender must run firmware that understands 0xAC frames.
-static const unsigned long LINK_DUTY_INTERVAL_MS = 30;
-static unsigned long lastLinkDutyMillis = 0;
-static uint8_t lastSentExtenderDuty[3] = {0, 0, 0};
-
-// Last level actually written to each local pin (after noise), so the
-// shimmer only costs an analogWrite when the value really changed.
-static uint16_t lastLocalOut[4] = {0, 0, 0, 0};
-
-void sendLinkChannelDuty(uint8_t channel, uint8_t duty8) {
-  linkSerial.write(LINK_DUTY_SYNC_BYTE);
-  linkSerial.write(channel);
-  linkSerial.write(duty8);
-}
-
-// Zeroes the engine so its notion of "current" matches channels that were
-// just forced dark (see the 'e' handler, which blacks out before this),
-// and reseeds the noise streams so a re-entry starts from fresh samples.
-void resetEffectFades() {
-  for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
-    effectFades[i].startDuty = 0;
-    effectFades[i].targetDuty = 0;
-    effectFades[i].currentDuty = 0;
-    effectFades[i].startMillis = 0;
-    effectFades[i].durationMs = 0;
-    noisePrev[i] = (uint8_t)random(256);
-    noiseNext[i] = (uint8_t)random(256);
-  }
-  noiseSegment = millis() / noisePeriodMs;
-  for (uint8_t i = 0; i < 3; i++) {
-    lastSentExtenderDuty[i] = 0;
-  }
-  for (uint8_t i = 0; i < 4; i++) {
-    lastLocalOut[i] = 0;
+    effectFades[i] = {0, 0, 0, 0, 0};
   }
 }
 
@@ -867,27 +366,28 @@ void setEffectTarget(uint8_t channel, uint16_t target) {
   f.startDuty = f.currentDuty;
   f.targetDuty = target;
   f.startMillis = millis();
-  bool rampsUp = target > f.currentDuty;
-  unsigned long duration = rampsUp ? effectFadeInMs : effectFadeOutMs;
-  uint8_t pct = rampsUp ? noiseFadeInPct : noiseFadeOutPct;
-  if (pct > 0) {
-    // scale this ramp's duration 0..2x (centered on 1x) by the channel's
-    // noise value at the moment the ramp starts
-    int32_t bipolar = (int32_t)effectNoise(channel) - 128; // -128..127
-    duration = (unsigned long)((int32_t)duration * (12800 + bipolar * (int32_t)pct) / 12800);
-  }
-  f.durationMs = duration;
+  f.durationMs = (target > f.currentDuty) ? EFFECT_FADE_IN_MS : EFFECT_FADE_OUT_MS;
+}
+
+// The extender's channels can't be PWM-addressed by a single frame per
+// channel without cost -- a full 3-channel update is 9 bytes (~9ms of
+// blocking SoftwareSerial TX at 9600 baud) and fades tick every ~10ms -- so
+// writes are throttled and only-on-change.
+static const unsigned long LINK_DUTY_INTERVAL_MS = 30;
+static unsigned long lastLinkDutyMillis = 0;
+static uint8_t lastSentExtenderDuty[3] = {0, 0, 0};
+
+// Last level actually written to each local pin (after the audio scale), so
+// a write only costs an analogWrite when the value really changed.
+static uint16_t lastLocalOut[4] = {0, 0, 0, 0};
+
+void sendLinkChannelDuty(uint8_t channel, uint8_t duty8) {
+  linkSerial.write(LINK_DUTY_SYNC_BYTE);
+  linkSerial.write(channel);
+  linkSerial.write(duty8);
 }
 
 void updateEffectFades() {
-  // Also idles while a MIDI flash overlay owns the pins -- applyEffectFrame()
-  // calls in here directly on frame advance, so the gate in delayWithSerial()
-  // alone wouldn't cover that path. Ramps are elapsed-time based and just
-  // catch up when the flash (<=80ms) ends.
-  if (!effectsMode || midiFlashActive) {
-    return;
-  }
-  updateEffectNoise();
   bool dutyWindowOpen = millis() - lastLinkDutyMillis >= LINK_DUTY_INTERVAL_MS;
   bool sentAny = false;
   for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
@@ -900,29 +400,11 @@ void updateEffectFades() {
       int32_t delta = (int32_t)f.targetDuty - (int32_t)f.startDuty;
       duty = (uint16_t)((int32_t)f.startDuty + delta * (int32_t)elapsed / (int32_t)f.durationMs);
     }
-    // currentDuty stays the un-noised ramp position (it advances even when
-    // the extender send is throttled), so retarget baselines and the
-    // brightness shimmer never feed back into each other.
     f.currentDuty = duty;
-    uint16_t out = duty;
-    if (noiseBrightnessPct > 0 && out > 0) {
-      uint32_t nv = effectNoise(i);
-      out = (uint16_t)((uint32_t)out * (25500 - nv * noiseBrightnessPct) / 25500);
-    }
-    // Performance mode never dims below its base brightness -- the MIDI
-    // flash (onMidiFlash()) adds on top of this same floor.
-    if (performanceMode) {
-      uint16_t base = performanceBaseDuty();
-      if (out < base) {
-        out = base;
-      }
-    }
-    // Audio master scale last, so a moving level re-triggers the
-    // change-detected writes below on its own -- no extra plumbing needed.
-    out = scaleDuty(out);
+    uint16_t out = scaleDuty(duty); // audio master scale, if any
     if (i < 4) {
       if (out != lastLocalOut[i]) {
-        analogWrite(EFFECT_LOCAL_PINS[i], activeLow ? PWM_MAX - out : out);
+        analogWrite(EFFECT_LOCAL_PINS[i], ACTIVE_LOW ? PWM_MAX - out : out);
         lastLocalOut[i] = out;
       }
     } else {
@@ -939,548 +421,108 @@ void updateEffectFades() {
   }
 }
 
-// ---- MIDI note flash ------------------------------------------------------
-// The MIDI_NOTE_LIGHT_REAL board (a XIAO ESP32-S3 watching a serial MIDI
-// stream) joins the SoftAP above and forwards each Note On as a
-// [0xAF][velocity] frame. When enabled ('g' toggles, on by default), every
-// frame flashes ALL seven channels -- the 4 local pins directly, the 3
-// extender channels via the 0xAB brightness frame -- at a velocity-scaled
-// brightness for a velocity-scaled duration, then hands the pins back to
-// whatever mode was running (current chase step, test-all level, effects
-// ramps). It's an overlay, not a mode: the chase/effects clock keeps
-// advancing underneath, only the pin writes pause (see delayWithSerial).
-// Blackout and calibration outrank it. The velocity mapping mirrors the
-// sender's matrix flash: min..max shaped by a curve exponent (>1 = ease-in,
-// so only hard hits reach full).
-//
-// While performance mode is running, that floor is the configurable base
-// brightness below instead of MIDI_FLASH_DUTY_MIN: the lights sit at that
-// level between notes and each flash adds velocity-scaled brightness on top
-// of it, still topping out at PWM_MAX on a hard hit.
-static bool midiFlashEnabled = true;
-static unsigned long midiFlashStartMillis = 0;
-static unsigned long midiFlashDurationMs = 0;
-static bool midiSeen = false;              // any [0xAF] frame since boot
-static unsigned long lastMidiRxMillis = 0; // meaningful once midiSeen
+// ---- Pattern selection ----------------------------------------------------
+// Channel 2 picks a pattern out of (1 + EFFECT_COUNT) equal-width DMX
+// buckets: bucket 0 is "no pattern" -- every channel held at a flat fill,
+// the fixture's default state -- buckets 1..EFFECT_COUNT are the ported
+// QLC+ scripts from effects.h, in array order. Channel 1's brightness
+// scales whichever pattern is active: for the flat fill it's the level
+// directly, for an animated pattern it scales each frame's on/off duty.
+static const unsigned long PATTERN_STEP_MS = 500; // animated pattern frame rate
+static uint8_t effectStep = 0;
+static uint8_t lastAppliedPatternIndex = 0xFF; // 0xFF = nothing applied yet
 
-static const uint16_t MIDI_FLASH_DUTY_MIN = 600;     // duty at velocity 1 (outside performance mode)
-static const uint16_t MIDI_FLASH_DUTY_MAX = PWM_MAX; // duty at velocity 127
-static const float MIDI_FLASH_BRIGHT_CURVE = 2.0f;
-static const unsigned long MIDI_FLASH_DUR_MIN_MS = 40;
-static const unsigned long MIDI_FLASH_DUR_MAX_MS = 80;
-static const float MIDI_FLASH_DUR_CURVE = 1.5f;
-static const uint8_t MIDI_SIM_VELOCITY = 100; // velocity used by the 'j' test-key simulated note
-
-float midiFlashMap(uint8_t velocity, float outMin, float outMax, float curve) {
-  float t = ((float)velocity - 1.0f) / 126.0f;
-  if (t < 0.0f) t = 0.0f;
-  if (t > 1.0f) t = 1.0f;
-  t = powf(t, curve);
-  return outMin + t * (outMax - outMin);
+uint8_t patternIndexFromDmx(uint8_t value) {
+  const uint8_t patternCount = EFFECT_COUNT + 1;
+  return (uint8_t)(((uint16_t)value * patternCount) / 256);
 }
 
-// ---- MIDI-driven tempo ------------------------------------------------
-// How busy the incoming Note On stream has been over the trailing 10s
-// speeds up the chase/effects step interval: the more notes per second,
-// the shorter the step, bottoming out at MIDI_TEMPO_MIN_STEP_MS. As the
-// note stream thins out, old hits fall out of the 10s window and the rate
-// decays back toward 0, easing the interval back to the user-configured
-// chaseStepMs (']'/'[') rather than snapping. Tracked independent of
-// midiFlashEnabled so tempo still follows the notes even with the visual
-// flash turned off.
-static const unsigned long MIDI_TEMPO_WINDOW_MS = 10000;
-static const unsigned long MIDI_TEMPO_MIN_STEP_MS = 1;
-static const float MIDI_TEMPO_RATE_MAX_HZ = 8.0f; // notes/sec that reaches the min step
-static const uint8_t MIDI_TEMPO_HISTORY_SIZE = 64;
-static unsigned long midiNoteTimes[MIDI_TEMPO_HISTORY_SIZE];
-static uint8_t midiNoteTimesHead = 0;
-static uint8_t midiNoteTimesCount = 0;
-
-void recordMidiNoteForTempo() {
-  midiNoteTimes[midiNoteTimesHead] = millis();
-  midiNoteTimesHead = (midiNoteTimesHead + 1) % MIDI_TEMPO_HISTORY_SIZE;
-  if (midiNoteTimesCount < MIDI_TEMPO_HISTORY_SIZE) {
-    midiNoteTimesCount++;
+// Recomputes every channel's target from the current (brightness, pattern,
+// effectStep) and applies it via setEffectTarget() -- the fade engine takes
+// it from there. Safe to call anytime (Art-Net frame arrival, or the
+// periodic step advance in loop()); a pattern change resets effectStep so
+// the new pattern always starts from its first frame.
+void applyPatternFrame(uint8_t brightness, uint8_t patternRaw) {
+  uint8_t pattern = patternIndexFromDmx(patternRaw);
+  if (pattern != lastAppliedPatternIndex) {
+    effectStep = 0;
+    lastAppliedPatternIndex = pattern;
   }
-}
-
-// Notes/sec seen in the trailing MIDI_TEMPO_WINDOW_MS, walking back from the
-// most recently recorded note until one falls outside the window.
-float midiNoteRateHz() {
-  if (midiNoteTimesCount == 0) {
-    return 0.0f;
-  }
-  unsigned long now = millis();
-  uint8_t counted = 0;
-  for (uint8_t i = 0; i < midiNoteTimesCount; i++) {
-    uint8_t idx = (uint8_t)((midiNoteTimesHead + MIDI_TEMPO_HISTORY_SIZE - 1 - i) % MIDI_TEMPO_HISTORY_SIZE);
-    if (now - midiNoteTimes[idx] > MIDI_TEMPO_WINDOW_MS) {
-      break; // entries are recorded in order, so everything older also expired
-    }
-    counted++;
-  }
-  return (float)counted / ((float)MIDI_TEMPO_WINDOW_MS / 1000.0f);
-}
-
-// Defined below, once chaseStepMs exists (see the Chase sequence section) --
-// eases chaseStepMs down as the MIDI_TEMPO_WINDOW_MS note rate climbs.
-unsigned long effectiveChaseStepMs();
-
-void onMidiFlash(uint8_t velocity) {
-  // Track the stream's liveness even when the flash itself is toggled off,
-  // so the periodic status report can still say the MIDI board is alive.
-  midiSeen = true;
-  lastMidiRxMillis = millis();
-  recordMidiNoteForTempo();
-  if (!midiFlashEnabled) {
-    static bool announced = false;
-    if (!announced) { // note the stream exists once, then stay quiet
-      announced = true;
-      Serial.println("[MIDI] flash frames arriving but MIDI_FLASH is off ('g' enables)");
+  uint16_t brightnessDuty = (uint16_t)((uint32_t)brightness * PWM_MAX / 255);
+  if (pattern == 0) {
+    for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
+      setEffectTarget(i, brightnessDuty);
     }
     return;
   }
-  if (blackout || calibrateMode) {
-    return; // blackout is absolute; calibration needs one unambiguous lamp
-  }
-
-  // In performance mode the notes flash on top of the base brightness floor
-  // rather than MIDI_FLASH_DUTY_MIN, so quiet passages never go darker than
-  // that base and a hard hit still reaches full.
-  uint16_t flashFloor = (performanceMode && effectsMode) ? performanceBaseDuty() : MIDI_FLASH_DUTY_MIN;
-  uint16_t duty = (uint16_t)midiFlashMap(velocity, flashFloor,
-                                         MIDI_FLASH_DUTY_MAX, MIDI_FLASH_BRIGHT_CURVE);
-  unsigned long duration = (unsigned long)midiFlashMap(velocity, MIDI_FLASH_DUR_MIN_MS,
-                                                       MIDI_FLASH_DUR_MAX_MS, MIDI_FLASH_DUR_CURVE);
-
-  fadingPin = 255; // the overlay owns the pins; a mid-ramp chase fade would fight it
-  uint16_t out = scaleDuty(duty); // the audio master scale dims flashes too
-  for (uint8_t i = 0; i < 4; i++) {
-    analogWrite(EFFECT_LOCAL_PINS[i], activeLow ? PWM_MAX - out : out);
-    // Record what the overlay wrote as the effects engine's notion of "last
-    // written", so its change-detected writes re-drive exactly the channels
-    // that differ once the flash ends.
-    lastLocalOut[i] = out;
-  }
-  sendLinkBrightness(out);
-  uint8_t duty8 = (uint8_t)((uint32_t)out * 255 / PWM_MAX);
-  for (uint8_t i = 0; i < 3; i++) {
-    lastSentExtenderDuty[i] = duty8;
-  }
-
-  bool retrigger = midiFlashActive; // a new note mid-flash just restarts the clock
-  midiFlashActive = true;
-  midiFlashStartMillis = millis();
-  midiFlashDurationMs = duration;
-  Serial.printf("[MIDI] flash vel=%u duty=%u dur=%lums%s\n", (unsigned)velocity,
-                (unsigned)out, duration, retrigger ? " (retrigger)" : "");
-}
-
-// Hands the channels back to whatever mode is active NOW -- keys keep
-// working mid-flash, so this reads the state fresh rather than restoring a
-// snapshot from when the flash started.
-void endMidiFlash() {
-  midiFlashActive = false;
-  if (calibrateMode) {
-    return; // beginCalibrate() already blacked out and re-lit its one lamp
-  }
-  if (testAllMode) {
-    applyTestAll();
-    return;
-  }
-  if (effectsMode) {
-    return; // updateEffectFades() re-drives from the caches set in onMidiFlash()
-  }
-  // Chase (or blackout/idle, where chaseLitChannel is 255 and everything
-  // goes dark): re-light only the current step's lamp, instantly -- starting
-  // a fade mid-step would look odd.
-  for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
-    bool on = ch == chaseLitChannel;
-    if (ch < 4) {
-      setMosfet(EFFECT_LOCAL_PINS[ch], on);
-    } else {
-      sendLinkCommand(ch - 4, on, false);
-    }
-  }
-}
-
-void updateMidiFlash() {
-  if (midiFlashActive && millis() - midiFlashStartMillis >= midiFlashDurationMs) {
-    endMidiFlash();
-  }
-}
-
-void adjustEffectFadeMs(unsigned long *value, long deltaMs, const char *label) {
-  long updated = (long)*value + deltaMs;
-  if (updated < 0) {
-    updated = 0;
-  } else if (updated > (long)EFFECT_FADE_MAX_MS) {
-    updated = EFFECT_FADE_MAX_MS;
-  }
-  *value = (unsigned long)updated;
-  Serial.printf("%s = %lu\n", label, *value);
-}
-
-void applyEffectFrame() {
-  const Effect &fx = EFFECTS[effectIndex];
+  const Effect &fx = EFFECTS[pattern - 1];
   uint16_t duty[EFFECT_CHANNELS];
   fx.frame(EFFECT_CHANNELS, 1, effectStep, duty);
-
-  // duty[] is indexed by physical position along the strip; each channel
-  // picks up the duty of the position its lamp actually sits at.
   for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
-    setEffectTarget(i, duty[channelPosition[i]]);
-  }
-  updateEffectFades(); // start the ramps (or snap, at 0ms) right away
-
-  char pattern[EFFECT_CHANNELS + 1];
-  for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
-    pattern[i] = duty[i] > 0 ? 'X' : '.';
-  }
-  pattern[EFFECT_CHANNELS] = '\0';
-  Serial.printf("[FX %s] step %u/%u %s\n", fx.name, (unsigned)(effectStep + 1),
-                (unsigned)fx.stepCount(EFFECT_CHANNELS, 1), pattern);
-}
-
-void selectEffect(uint8_t index) {
-  effectIndex = index;
-  effectStep = 0;
-  Serial.printf("[FX] effect %u/%u: %s\n", (unsigned)(effectIndex + 1),
-                (unsigned)EFFECT_COUNT, EFFECTS[effectIndex].name);
-  applyEffectFrame();
-}
-
-// The performance-mode timer tick (runs from delayWithSerial(), so a switch
-// lands within ~10ms of its deadline regardless of the current step length).
-// Picks among the OTHER effects so a hop always visibly changes the pattern.
-void updatePerformanceMode() {
-  if (!performanceMode || !effectsMode) {
-    return;
-  }
-  if (millis() - performanceLastSwitchMillis < performanceIntervalMs) {
-    return;
-  }
-  schedulePerformanceSwitch();
-  uint8_t next = effectIndex;
-  if (EFFECT_COUNT > 1) {
-    next = (uint8_t)random(EFFECT_COUNT - 1);
-    if (next >= effectIndex) {
-      next++;
-    }
-  }
-  Serial.printf("[PERF] auto-switching effect (next hop in %lus)\n",
-                performanceIntervalMs / 1000);
-  selectEffect(next);
-}
-
-// Chase sequence: exactly one lamp lit at a time, chaseStepMs per step,
-// walking physical positions 0-6 in order. Which pin lights on each step
-// comes from the light-order map (see channelPosition above), so the pulse
-// always travels down the physical row even when the lamps aren't hung in
-// pin order. chaseStepMs is adjustable live over serial with ']'/'[' --
-// since loop() re-reads it fresh at the start of every step, a change
-// lands on the next step rather than mid-step.
-static const uint8_t CHASE_STEP_COUNT = EFFECT_CHANNELS;
-static unsigned long chaseStepMs = 500;
-static const unsigned long CHASE_STEP_STEP_MS = 50;
-static const unsigned long CHASE_STEP_MIN_MS = 1;
-static const unsigned long CHASE_STEP_MAX_MS = 1000;
-
-void adjustChaseStep(long deltaMs) {
-  long updated = (long)chaseStepMs + deltaMs;
-  if (updated < (long)CHASE_STEP_MIN_MS) {
-    updated = CHASE_STEP_MIN_MS;
-  } else if (updated > (long)CHASE_STEP_MAX_MS) {
-    updated = CHASE_STEP_MAX_MS;
-  }
-  chaseStepMs = (unsigned long)updated;
-  Serial.printf("CHASE_STEP_MS = %lu\n", chaseStepMs);
-}
-
-// Chase/effects step length: chaseStepMs eased down toward
-// MIDI_TEMPO_MIN_STEP_MS as the MIDI note rate (see midiNoteRateHz() above)
-// climbs toward MIDI_TEMPO_RATE_MAX_HZ, falling straight back to chaseStepMs
-// once the stream goes quiet and the rate decays out of the window.
-unsigned long effectiveChaseStepMs() {
-  float rate = midiNoteRateHz();
-  if (rate <= 0.0f || chaseStepMs <= MIDI_TEMPO_MIN_STEP_MS) {
-    return chaseStepMs;
-  }
-  float t = rate / MIDI_TEMPO_RATE_MAX_HZ;
-  if (t > 1.0f) {
-    t = 1.0f;
-  }
-  unsigned long span = chaseStepMs - MIDI_TEMPO_MIN_STEP_MS;
-  return chaseStepMs - (unsigned long)(t * (float)span);
-}
-
-void applyChaseStep(uint8_t step) {
-  chaseLitChannel = channelAtPosition(step);
-  // While a MIDI flash overlay is lit, leave the pins alone -- endMidiFlash()
-  // re-lights the (freshly advanced) chase channel when the flash ends.
-  if (!midiFlashActive) {
-    for (uint8_t ch = 0; ch < EFFECT_CHANNELS; ch++) {
-      bool on = channelPosition[ch] == step;
-      if (ch < 4) {
-        applyLocalPin(EFFECT_LOCAL_PINS[ch], on);
-      } else {
-        sendLinkCommand(ch - 4, on, fadeMode);
-      }
-    }
-  }
-
-  Serial.printf("chase position %u/%u -> %s%s\n", (unsigned)(step + 1),
-                (unsigned)CHASE_STEP_COUNT, CHANNEL_NAMES[channelAtPosition(step)],
-                fadeMode ? " (fade)" : "");
-}
-
-// Send '1' for active-LOW, '0' for active-HIGH, '2' to toggle the PWM fade,
-// '+'/'-' to adjust the fade duration (or the shared brightness while in
-// test-all mode; '=' also counts as '+' for keyboards where '+' needs
-// shift), ']'/'[' to adjust the chase step length, 'b' to toggle blackout,
-// 't' to toggle test-all mode. Line endings and whitespace are ignored;
-// any other unrecognized byte is echoed back with its hex code so a
-// terminal sending something unexpected is visible instead of silent.
-void handleSerial() {
-  // Audio frames ([0xAD][level] / [0xAE][depth], see the audio section)
-  // interleave with the key commands on the same port. A sync byte parks
-  // here until its value byte arrives -- possibly on a later loop pass.
-  static uint8_t pendingAudioSync = 0;
-  while (Serial.available()) {
-    uint8_t b = (uint8_t)Serial.read();
-    if (pendingAudioSync != 0) {
-      handleAudioFrame(pendingAudioSync, b);
-      pendingAudioSync = 0;
-      continue;
-    }
-    if (b == AUDIO_LEVEL_SYNC_BYTE || b == AUDIO_DEPTH_SYNC_BYTE ||
-        b == MIDI_FLASH_SYNC_BYTE) {
-      pendingAudioSync = b;
-      continue;
-    }
-    char c = (char)b;
-    if (calibrateMode) {
-      handleCalibrateKey(c); // swallows every key so digits stay calibration input
-      continue;
-    }
-    if (c == '1') {
-      if (!activeLow) {
-        activeLow = true;
-        Serial.println("ACTIVE_LOW = true");
-        if (testAllMode) {
-          applyTestAll(); // re-drive at the new polarity right away
-        }
-      }
-    } else if (c == '0') {
-      if (activeLow) {
-        activeLow = false;
-        Serial.println("ACTIVE_LOW = false");
-        if (testAllMode) {
-          applyTestAll();
-        }
-      }
-    } else if (c == '2') {
-      fadeMode = !fadeMode;
-      Serial.printf("FADE_MODE = %s\n", fadeMode ? "true" : "false");
-    } else if (c == '+' || c == '=') {
-      if (testAllMode) {
-        adjustTestBrightness(TEST_BRIGHTNESS_STEP);
-      } else if (effectsMode) {
-        adjustEffectFadeMs(&effectFadeInMs,
-                           (c == '+') ? EFFECT_FADE_COARSE_STEP_MS : EFFECT_FADE_FINE_STEP_MS,
-                           "EFFECT_FADE_IN_MS");
-      } else {
-        adjustFadeDuration((long)FADE_DURATION_STEP_MS);
-      }
-    } else if (c == '-' || c == '_') {
-      if (testAllMode) {
-        adjustTestBrightness(-TEST_BRIGHTNESS_STEP);
-      } else if (effectsMode) {
-        adjustEffectFadeMs(&effectFadeInMs,
-                           (c == '_') ? -EFFECT_FADE_COARSE_STEP_MS : -EFFECT_FADE_FINE_STEP_MS,
-                           "EFFECT_FADE_IN_MS");
-      } else {
-        adjustFadeDuration(-(long)FADE_DURATION_STEP_MS);
-      }
-    } else if (c == '.') {
-      adjustEffectFadeMs(&effectFadeOutMs, EFFECT_FADE_FINE_STEP_MS, "EFFECT_FADE_OUT_MS");
-    } else if (c == ',') {
-      adjustEffectFadeMs(&effectFadeOutMs, -EFFECT_FADE_FINE_STEP_MS, "EFFECT_FADE_OUT_MS");
-    } else if (c == '>') {
-      adjustEffectFadeMs(&effectFadeOutMs, EFFECT_FADE_COARSE_STEP_MS, "EFFECT_FADE_OUT_MS");
-    } else if (c == '<') {
-      adjustEffectFadeMs(&effectFadeOutMs, -EFFECT_FADE_COARSE_STEP_MS, "EFFECT_FADE_OUT_MS");
-    } else if (c == 'a') {
-      adjustNoisePct(&noiseBrightnessPct, NOISE_PCT_STEP, "NOISE_BRIGHTNESS_PCT");
-    } else if (c == 'z') {
-      adjustNoisePct(&noiseBrightnessPct, -NOISE_PCT_STEP, "NOISE_BRIGHTNESS_PCT");
-    } else if (c == 's') {
-      adjustNoisePct(&noiseFadeInPct, NOISE_PCT_STEP, "NOISE_FADE_IN_PCT");
-    } else if (c == 'x') {
-      adjustNoisePct(&noiseFadeInPct, -NOISE_PCT_STEP, "NOISE_FADE_IN_PCT");
-    } else if (c == 'd') {
-      adjustNoisePct(&noiseFadeOutPct, NOISE_PCT_STEP, "NOISE_FADE_OUT_PCT");
-    } else if (c == 'c') {
-      adjustNoisePct(&noiseFadeOutPct, -NOISE_PCT_STEP, "NOISE_FADE_OUT_PCT");
-    } else if (c == 'f') {
-      adjustNoisePeriod((long)NOISE_PERIOD_STEP_MS);
-    } else if (c == 'v') {
-      adjustNoisePeriod(-(long)NOISE_PERIOD_STEP_MS);
-    } else if (c == 'o') {
-      adjustNoisePct(&audioDepthPct, NOISE_PCT_STEP, "AUDIO_DEPTH_PCT"); // same clamp-and-print
-    } else if (c == 'l') {
-      adjustNoisePct(&audioDepthPct, -NOISE_PCT_STEP, "AUDIO_DEPTH_PCT");
-    } else if (c == ']') {
-      adjustChaseStep((long)CHASE_STEP_STEP_MS);
-    } else if (c == '[') {
-      adjustChaseStep(-(long)CHASE_STEP_STEP_MS);
-    } else if (c == 'b') {
-      if (testAllMode) {
-        Serial.println("(blackout ignored while TEST_ALL active -- press 't' to exit first)");
-      } else if (effectsMode) {
-        Serial.println("(blackout ignored while EFFECTS active -- press 'e' to exit first)");
-      } else {
-        blackout = !blackout;
-        Serial.printf("BLACKOUT = %s\n", blackout ? "true" : "false");
-        if (blackout) {
-          applyBlackout();
-        }
-      }
-    } else if (c == 't') {
-      testAllMode = !testAllMode;
-      if (testAllMode) {
-        blackout = false; // test-all overrides an active blackout or effects mode
-        effectsMode = false;
-        testBrightness = TEST_BRIGHTNESS_INITIAL;
-        Serial.printf("TEST_ALL = true (all channels on, brightness %d/%d, '+'/'-' adjusts)\n",
-                      testBrightness, PWM_MAX);
-        applyTestAll();
-      } else {
-        Serial.println("TEST_ALL = false");
-        applyBlackout(); // everything off; the chase re-lights on its next step
-      }
-    } else if (c == 'e') {
-      effectsMode = !effectsMode;
-      if (effectsMode) {
-        blackout = false; // effects mode overrides an active blackout or test-all
-        testAllMode = false;
-        applyBlackout();    // known-dark baseline (also cancels any chase fade)...
-        resetEffectFades(); // ...so the engine's zeroed state matches the pins
-        Serial.println("EFFECTS_MODE = true ('n'/'p' effect, ']'/'[' speed, '='/'-' fade-in, '.'/',' fade-out (x10 shifted), 'e' exits;");
-        Serial.printf("noise depths: 'a'/'z' brightness %u%%, 's'/'x' fade-in %u%%, 'd'/'c' fade-out %u%%, 'f'/'v' period %lums)\n",
-                      (unsigned)noiseBrightnessPct, (unsigned)noiseFadeInPct, (unsigned)noiseFadeOutPct, noisePeriodMs);
-        schedulePerformanceSwitch(); // fresh countdown, not an instant hop off a stale timer
-        selectEffect(effectIndex);
-      } else {
-        Serial.println("EFFECTS_MODE = false");
-        applyBlackout(); // everything off; the chase re-lights on its next step
-      }
-    } else if (c == 'g') {
-      midiFlashEnabled = !midiFlashEnabled;
-      Serial.printf("MIDI_FLASH = %s\n", midiFlashEnabled ? "true" : "false");
-      if (!midiFlashEnabled && midiFlashActive) {
-        endMidiFlash(); // hand the pins back now rather than waiting out the timer
-      }
-    } else if (c == 'm') {
-      blackout = false; // calibration overrides blackout/test-all/effects
-      testAllMode = false;
-      effectsMode = false;
-      beginCalibrate();
-    } else if (c == 'r') {
-      performanceMode = !performanceMode;
-      Serial.printf("PERFORMANCE_MODE = %s\n", performanceMode ? "true" : "false");
-      if (performanceMode) {
-        schedulePerformanceSwitch(); // a full fresh interval from right now
-        if (!effectsMode) { // performance mode means effects running
-          blackout = false;
-          testAllMode = false;
-          effectsMode = true;
-          applyBlackout();    // same known-dark entry as the 'e' handler
-          resetEffectFades();
-          selectEffect((uint8_t)random(EFFECT_COUNT));
-        }
-      }
-    } else if (c == 'j') {
-      onMidiFlash(MIDI_SIM_VELOCITY); // fake a Note On for testing without the MIDI board
-    } else if (c == 'n' || c == 'p') {
-      if (!effectsMode) {
-        Serial.println("('n'/'p' only selects effects while EFFECTS active -- press 'e' first)");
-      } else {
-        if (c == 'n') {
-          selectEffect((effectIndex + 1) % EFFECT_COUNT);
-        } else {
-          selectEffect((effectIndex + EFFECT_COUNT - 1) % EFFECT_COUNT);
-        }
-        schedulePerformanceSwitch(); // a manual pick restarts the auto-switch countdown
-      }
-    } else if (c != '\r' && c != '\n' && c != '\t' && c != ' ' && c != 0) {
-      Serial.printf("(unhandled key 0x%02X '%c')\n", (uint8_t)c, (c >= 32 && c < 127) ? c : '?');
-    }
+    uint16_t raw = duty[channelPosition[i]]; // duty[] is indexed by physical position
+    setEffectTarget(i, (uint16_t)((uint32_t)raw * brightnessDuty / EFFECT_DUTY_MAX));
   }
 }
 
-// Times out the audio stream (that's the whole "optional" contract: no
-// frames for AUDIO_TIMEOUT_MS and the scale snaps back to full brightness)
-// and, whenever the master scale moved, re-drives whatever is statically
-// lit so it follows the music instead of freezing at the level it was
-// switched on with. Effects mode needs no help: updateEffectFades()
-// recomputes every channel each tick and its change-detected writes fire on
-// their own. Extender refreshes ride the 0xAC duty frame and share the
-// effects engine's 30ms throttle; while they stream, they override the
-// extender's own on/off fade (the chase's fadeMode bit) -- acceptable,
-// since the audio level is the livelier signal.
-void updateAudio() {
-  if (audioActive && millis() - lastAudioRxMillis >= AUDIO_TIMEOUT_MS) {
-    audioActive = false; // audioScale255() falls back to full below
-    Serial.println("[AUDIO] level stream lost -- restoring full brightness");
+// ---- Art-Net DMX control ---------------------------------------------
+// A minimal 2-channel ArtDMX receiver: channel 1 = brightness, channel 2 =
+// pattern (see above). No universe filtering yet: whichever Art-Net
+// universe QLC+ is configured to send, channels 1-2 of it are read. There's
+// no timeout hand-back -- losing the Art-Net stream leaves the relays
+// holding their last commanded state.
+static bool artnetActive = false;
+static unsigned long lastArtnetRxMillis = 0;
+static uint8_t artnetBrightness = 0;
+static uint8_t artnetPatternRaw = 0;
+
+void onArtnetDmx(uint8_t brightness, uint8_t patternRaw) {
+  lastArtnetRxMillis = millis();
+  if (!artnetActive) {
+    artnetActive = true;
+    Serial.println("[ARTNET] ArtDMX stream active");
   }
-  uint8_t scale = audioScale255();
-  if (scale == lastAppliedAudioScale) {
-    return;
-  }
-  if (effectsMode || blackout || calibrateMode) {
-    lastAppliedAudioScale = scale; // nothing statically lit that needs re-driving
-    return;
-  }
-  if (testAllMode) {
-    if (millis() - lastLinkDutyMillis < LINK_DUTY_INTERVAL_MS) {
-      return; // applyTestAll() sends a link frame; retry next tick
+  artnetBrightness = brightness;
+  artnetPatternRaw = patternRaw;
+  applyPatternFrame(artnetBrightness, artnetPatternRaw);
+}
+
+// Art-Net packet layout (see the Art-Net 4 spec): 8-byte ID "Art-Net\0", a
+// 16-bit OpCode (little-endian), a 16-bit ProtVer (big-endian), then for
+// OpDmx (0x5000): Sequence, Physical, SubUni, Net, a 16-bit Length
+// (big-endian), then Length bytes of DMX data starting at channel 1. We
+// only need the first two data bytes, but still validate the header so a
+// stray UDP packet on this port can't be misread as a DMX frame. A packet
+// with only channel 1 present (no channel 2) is still applied, with the
+// pattern treated as 0 (no pattern).
+static const uint16_t ARTNET_OPCODE_DMX = 0x5000;
+static const size_t ARTNET_HEADER_LEN = 18; // through the two length bytes
+
+void pollArtnetUdp() {
+  while (artnetUdp.parsePacket() > 0) {
+    uint8_t buf[ARTNET_HEADER_LEN + 2]; // header + DMX channels 1-2
+    int len = artnetUdp.read(buf, sizeof(buf));
+    if (len <= (int)ARTNET_HEADER_LEN) {
+      continue; // no DMX data at all
     }
-    lastAppliedAudioScale = scale;
-    applyTestAll();
-    lastLinkDutyMillis = millis();
-    return;
-  }
-  if (chaseLitChannel == 255) {
-    lastAppliedAudioScale = scale;
-    return;
-  }
-  if (chaseLitChannel < 4) {
-    uint8_t pin = EFFECT_LOCAL_PINS[chaseLitChannel];
-    if (fadingPin != pin) { // mid-fade, updateFade() already scales every tick
-      uint16_t duty = scaleDuty(PWM_MAX);
-      analogWrite(pin, activeLow ? PWM_MAX - duty : duty);
+    if (memcmp(buf, "Art-Net", 7) != 0 || buf[7] != 0) {
+      continue; // not an Art-Net packet
     }
-    lastAppliedAudioScale = scale;
-  } else {
-    if (millis() - lastLinkDutyMillis < LINK_DUTY_INTERVAL_MS) {
-      return;
+    uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);
+    if (opcode != ARTNET_OPCODE_DMX) {
+      continue; // ignore ArtPoll and everything else we don't need yet
     }
-    lastAppliedAudioScale = scale;
-    sendLinkChannelDuty(chaseLitChannel - 4, scale); // scale == scaled full in 8-bit
-    lastLinkDutyMillis = millis();
+    uint8_t brightness = buf[ARTNET_HEADER_LEN];
+    uint8_t pattern = (len > (int)ARTNET_HEADER_LEN + 1) ? buf[ARTNET_HEADER_LEN + 1] : 0;
+    onArtnetDmx(brightness, pattern);
   }
 }
 
 // ---- Periodic connection status -------------------------------------------
-// Every STATUS_REPORT_INTERVAL_MS, one line summarizing every link to the
-// other boards: the extender's serial heartbeat, how many stations have
-// joined the SoftAP (the PC audio bridge and/or the MIDI board), and how
-// recently each wireless stream (audio level frames, MIDI note frames) was
-// heard from. Complements the change-triggered [LINK]/[AUDIO]/[MIDI] logs:
-// those say when something happens, this keeps saying where everything
-// stands -- including the quiet states (WAITING, "no frames yet") that
-// otherwise only show up by their absence.
+// Every STATUS_REPORT_INTERVAL_MS, one line summarizing every link: the
+// extender's serial heartbeat, how many stations have joined the SoftAP,
+// and how recently the audio and Art-Net streams were heard from.
+// Complements the change-triggered [LINK]/[AUDIO]/[ARTNET] logs: those say
+// when something happens, this keeps saying where everything stands.
 static const unsigned long STATUS_REPORT_INTERVAL_MS = 10000;
 static unsigned long lastStatusReportMillis = 0;
 
@@ -1524,41 +566,26 @@ void printConnectionStatus() {
 
   if (artnetActive) {
     formatAge(age, sizeof(age), lastArtnetRxMillis);
-    Serial.printf(" | artnet: active (brightness %d/%d, %s)", testBrightness, PWM_MAX, age);
+    Serial.printf(" | artnet: active (brightness %u/255, pattern %u/%u, %s)",
+                  (unsigned)artnetBrightness, (unsigned)patternIndexFromDmx(artnetPatternRaw),
+                  (unsigned)EFFECT_COUNT, age);
   } else {
     Serial.print(" | artnet: none");
-  }
-
-  if (midiSeen) {
-    formatAge(age, sizeof(age), lastMidiRxMillis);
-    Serial.printf(" | MIDI: last note %s%s", age, midiFlashEnabled ? "" : " (flash off)");
-  } else {
-    Serial.print(" | MIDI: no frames yet");
   }
   Serial.println();
 }
 
-// Same as delay(), but keeps polling serial, the audio stream, the link
-// status, and any in-progress fade so they all stay responsive within ~10ms
-// instead of waiting out the rest of the chase step.
-void delayWithSerial(unsigned long ms) {
+// Same as delay(), but keeps polling the UDP streams, the link status, and
+// the fade engine so they all stay responsive within ~10ms instead of
+// waiting out the rest of the pattern step.
+void delayWhilePolling(unsigned long ms) {
   unsigned long start = millis();
   do {
-    handleSerial();
     pollAudioUdp();
     pollArtnetUdp();
     updateLinkStatus();
     printConnectionStatus();
-    updateMidiFlash();
-    // The MIDI flash overlay owns every channel while it's lit; these three
-    // all write duty levels and would fight it, so they pause (<=80ms, the
-    // max flash length) until it ends.
-    if (!midiFlashActive) {
-      updateFade();
-      updateEffectFades();
-      updateAudio();
-      updatePerformanceMode();
-    }
+    updateEffectFades();
     delay(10);
   } while (millis() - start < ms);
 }
@@ -1566,28 +593,8 @@ void delayWithSerial(unsigned long ms) {
 void setup() {
   Serial.begin(115200);
   Serial.println("\nMULTIPLEX_8266 starting...");
-  Serial.println("Send '1' for active-LOW, '0' for active-HIGH (default), '2' to toggle PWM fade,");
-  Serial.println("'+'/'-' to adjust fade duration, ']'/'[' to adjust chase step length, 'b' to toggle blackout,");
-  Serial.println("'t' to toggle test-all mode (all channels on; '+'/'-' then adjusts brightness),");
-  Serial.println("'e' to toggle effects test mode ('n'/'p' selects the effect; '='/'-' adjusts its");
-  Serial.println("fade-in and '.'/',' its fade-out, 1ms per press, or 10ms shifted ('+'/'_' and");
-  Serial.println("'>'/'<'), 0 = instant).");
-  Serial.println("Effects noise depths: 'a'/'z' brightness, 's'/'x' fade-in, 'd'/'c' fade-out");
-  Serial.println("(10% per press, 0 = off), 'f'/'v' noise period (100ms per press).");
-  Serial.println("'m' to calibrate the physical light order (each channel lights alone; type its");
-  Serial.println("position 1-7; the order is saved to EEPROM and survives reboots).");
-  Serial.println("'o'/'l' to raise/lower the audio depth (how much the PC audio level stream");
-  Serial.println("dims the lights, 10% per press; see AUDIO_LEVEL_BRIDGE/ for the PC script).");
-  Serial.println("'g' to toggle the MIDI note flash (on by default): note frames from the");
-  Serial.println("MIDI_NOTE_LIGHT_REAL board flash every channel, velocity-scaled.");
-  Serial.println("'j' to simulate a MIDI Note On (fixed velocity), for testing without the");
-  Serial.println("MIDI_NOTE_LIGHT_REAL board attached -- also feeds the note-rate chase tempo.");
-  Serial.println("'r' to toggle performance mode (ON at boot): effects mode runs and hops to a");
-  Serial.println("different random effect every 30-60s ('n'/'p' still picks manually).");
-
-  // Seed the effects noise from the hardware RNG so each boot wanders
-  // differently -- Arduino random() is otherwise deterministic.
-  randomSeed(RANDOM_REG32);
+  Serial.println("2-channel Art-Net fixture: channel 1 = brightness, channel 2 = pattern.");
+  Serial.println("See ARTNET_CONTROL.md. No serial control -- this is log output only.");
 
   bootFlashStatusLed();
   analogWriteRange(PWM_MAX);
@@ -1595,7 +602,7 @@ void setup() {
   EEPROM.begin(MAP_EEPROM_SIZE);
   loadChannelMap();
 
-  setupAudioWifi();
+  setupWifi();
 
   linkSerial.begin(LINK_BAUD);
   linkStateSinceMillis = millis();
@@ -1605,37 +612,18 @@ void setup() {
   pinMode(MOSFET_PIN_C, OUTPUT);
   pinMode(MOSFET_PIN_D, OUTPUT);
 
-  // Boot straight into performance mode: effects running from a randomly
-  // picked starting effect, auto-hopping per updatePerformanceMode(). Must
-  // come after the pinMode calls above (selectEffect() drives the pins) and
-  // after randomSeed() so the first pick differs boot to boot.
-  effectsMode = true;
-  resetEffectFades();
-  schedulePerformanceSwitch();
-  selectEffect((uint8_t)random(EFFECT_COUNT));
+  // Boots dark, with no pattern active (bucket 0) until Art-Net says
+  // otherwise -- artnetBrightness/artnetPatternRaw both default to 0.
+  initEffectFades();
+  applyPatternFrame(artnetBrightness, artnetPatternRaw);
 }
 
 void loop() {
-  if (effectsMode) {
-    // selectEffect() already applied the current frame; hold it for one
-    // step, then advance. Re-check the mode after the delay -- 'e', 't',
-    // or a switched effect may have landed mid-delay via handleSerial().
-    delayWithSerial(effectiveChaseStepMs());
-    if (effectsMode) {
-      effectStep = (effectStep + 1) % EFFECTS[effectIndex].stepCount(EFFECT_CHANNELS, 1);
-      applyEffectFrame();
-    }
-    return;
+  uint8_t pattern = patternIndexFromDmx(artnetPatternRaw);
+  if (pattern != 0) {
+    const Effect &fx = EFFECTS[pattern - 1];
+    effectStep = (effectStep + 1) % fx.stepCount(EFFECT_CHANNELS, 1);
   }
-  if (testAllMode || blackout || calibrateMode) {
-    delayWithSerial(50); // idle, but still responsive to 't'/'b'/'m' and '+'/'-'
-    return;
-  }
-  for (uint8_t step = 0; step < CHASE_STEP_COUNT; step++) {
-    if (blackout || testAllMode || effectsMode || calibrateMode) {
-      break; // bail out mid-sequence so a mode change doesn't wait out the chase
-    }
-    applyChaseStep(step);
-    delayWithSerial(effectiveChaseStepMs());
-  }
+  applyPatternFrame(artnetBrightness, artnetPatternRaw);
+  delayWhilePolling(PATTERN_STEP_MS);
 }
