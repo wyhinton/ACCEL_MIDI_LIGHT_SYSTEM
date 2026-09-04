@@ -33,6 +33,13 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define OLED_ADDR 0x3C
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
+// Whether display.begin() actually succeeded. The OLED is a diagnostic
+// nicety -- driving the PCA9685 channels is this board's real job -- so a
+// dead/miswired display must not stop us from serving the link (it used to
+// spin forever in setup(), which looked exactly like a Wi-Fi failure from
+// the primary's side: still associated, but never a single heartbeat).
+static bool displayReady = false;
+
 // Last commanded PWM value (0-4095) per channel, used to draw the level bars.
 uint16_t channelLevels[NUM_CHANNELS] = {0};
 
@@ -60,6 +67,12 @@ static const uint8_t LINK_DUTY_SYNC_BYTE = 0xAC;
 // packets keep arriving.
 static const unsigned long LINK_HEARTBEAT_INTERVAL_MS = 250;
 static unsigned long lastLinkHeartbeatMillis = 0;
+
+// Counted purely for the status line below: when the primary reports this
+// board as DOWN, these say whether the silence is ours (never joined the
+// AP) or the primary's (joined, but no duty packets ever arrived).
+static unsigned long dutyPacketCount = 0;
+static unsigned long lastDutyRxMillis = 0;
 
 void sendLinkHeartbeatIfDue() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -91,23 +104,76 @@ void logWifiStatusChange() {
   }
 }
 
-// Onboard ESP-12E LED (D4/GPIO2), active-LOW. Blinks on a fixed interval as
-// a simple "firmware is alive" heartbeat, independent of the fade timing.
+// Onboard ESP-12E LED (D4/GPIO2), active-LOW, doing double duty:
+//
+//   - Off the SoftAP: 3 rapid blinks every 3s (see updateStatusLed()). The
+//     primary can't distinguish "this board is off the network" from "this
+//     board is wedged" -- both just look like silence to it -- so this
+//     board says it locally, in a pattern deliberately unlike every other
+//     LED state here.
+//   - Joined: flashes rapidly for 1s at boot, then toggles once per
+//     incoming duty packet (see pollLink()) as a link-activity indicator --
+//     same as MULTIPLEX_8266's Art-Net LED, just fed by the relayed
+//     [0xAC][channel][duty] packets this board actually receives. Solid and
+//     unchanging means no fresh data since the last toggle (expected while
+//     a scene holds, since the primary only sends on change); flickering
+//     means the link is actively delivering updates.
 static const uint8_t STATUS_LED_PIN = LED_BUILTIN;
-static const unsigned long HEARTBEAT_INTERVAL_MS = 500;
-unsigned long lastHeartbeatToggle = 0;
-bool heartbeatOn = false;
+static bool statusLedOn = true; // matches the solid-on state bootFlashStatusLed() leaves it in
+
+// Disconnected pattern: DISCONNECTED_BLINK_COUNT on-pulses of
+// DISCONNECTED_BLINK_MS (with equal gaps between them), then dark for the
+// remainder of DISCONNECTED_PATTERN_MS.
+static const unsigned long DISCONNECTED_BLINK_MS = 100;
+static const unsigned long DISCONNECTED_BLINK_COUNT = 3;
+static const unsigned long DISCONNECTED_PATTERN_MS = 3000;
+static bool ledSawConnected = false;
 
 // Throttle OLED redraws so the shared I2C bus isn't saturated by display
 // writes on every fade step.
 static const unsigned long DISPLAY_INTERVAL_MS = 50;
 unsigned long lastDisplayUpdate = 0;
 
-void updateHeartbeat() {
-  if (millis() - lastHeartbeatToggle >= HEARTBEAT_INTERVAL_MS) {
-    lastHeartbeatToggle = millis();
-    heartbeatOn = !heartbeatOn;
-    digitalWrite(STATUS_LED_PIN, heartbeatOn ? LOW : HIGH);
+void bootFlashStatusLed() {
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  unsigned long start = millis();
+  bool on = false;
+  while (millis() - start < 1000) {
+    on = !on;
+    digitalWrite(STATUS_LED_PIN, on ? LOW : HIGH);
+    delay(50);
+  }
+  digitalWrite(STATUS_LED_PIN, LOW); // solid on; updateStatusLed() takes it from here
+}
+
+void toggleStatusLed() {
+  statusLedOn = !statusLedOn;
+  digitalWrite(STATUS_LED_PIN, statusLedOn ? LOW : HIGH);
+}
+
+// Owns the LED whenever we're off the SoftAP, and hands it back to
+// pollLink()'s per-packet toggle once we're on. Driven off millis() modulo
+// the pattern period rather than its own timer state, so it stays a pure
+// function of the clock -- nothing to get out of phase if a caller skips a
+// tick during a long I2C write.
+void updateStatusLed() {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected) {
+    if (!ledSawConnected) {
+      ledSawConnected = true;
+      statusLedOn = true;
+      digitalWrite(STATUS_LED_PIN, LOW); // solid until the next duty packet toggles it
+    }
+    return;
+  }
+  ledSawConnected = false;
+
+  unsigned long phase = millis() % DISCONNECTED_PATTERN_MS;
+  unsigned long blinkWindow = (2 * DISCONNECTED_BLINK_COUNT - 1) * DISCONNECTED_BLINK_MS;
+  bool on = (phase < blinkWindow) && ((phase / DISCONNECTED_BLINK_MS) % 2 == 0);
+  if (on != statusLedOn) {
+    statusLedOn = on;
+    digitalWrite(STATUS_LED_PIN, statusLedOn ? LOW : HIGH);
   }
 }
 
@@ -135,6 +201,9 @@ void pollLink() {
     if (len < 3 || buf[0] != LINK_DUTY_SYNC_BYTE || buf[1] >= LINK_CHANNEL_COUNT) {
       continue;
     }
+    dutyPacketCount++;
+    lastDutyRxMillis = millis();
+    toggleStatusLed();
     handleLinkChannelDuty(buf[1], buf[2]);
   }
 }
@@ -159,17 +228,52 @@ void scanI2CBus() {
 
 // Same as delay(), but keeps servicing the link so a long pause here (e.g.
 // the boot splash below) doesn't drop incoming duty packets or let our own
-// heartbeat go quiet long enough for the primary to log us as down.
+// link heartbeat (see sendLinkHeartbeatIfDue()) go quiet long enough for the
+// primary to log us as down.
 void delayWhilePollingLink(unsigned long ms) {
   unsigned long start = millis();
   do {
     pollLink();
     sendLinkHeartbeatIfDue();
+    updateStatusLed();
     delay(10);
   } while (millis() - start < ms);
 }
 
+// One line every few seconds to USB serial. There's no telnet mirror on
+// this board like MULTIPLEX_8266 has, so when the primary reports us DOWN
+// this is the only place to see which half of the link is at fault.
+static const unsigned long STATUS_REPORT_INTERVAL_MS = 5000;
+static unsigned long lastStatusReportMillis = 0;
+
+void printStatusReport() {
+  if (millis() - lastStatusReportMillis < STATUS_REPORT_INTERVAL_MS) {
+    return;
+  }
+  lastStatusReportMillis = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // Raw status code included because it separates the common failures:
+    // 1 = SSID not found (primary's AP is down), 4 = auth/assoc failed,
+    // 6 = disconnected/still trying.
+    Serial.printf("[STATUS] wifi: NOT connected to %s (status %d) | oled: %s\n",
+                  WIFI_SSID, (int)WiFi.status(), displayReady ? "ok" : "FAILED");
+    return;
+  }
+  Serial.printf("[STATUS] wifi: %s as %s | oled: %s | duty packets: %lu",
+                WIFI_SSID, WiFi.localIP().toString().c_str(),
+                displayReady ? "ok" : "FAILED", dutyPacketCount);
+  if (dutyPacketCount == 0) {
+    Serial.println(F(" (none yet -- primary hasn't sent any)"));
+  } else {
+    Serial.printf(" (last %lums ago)\n", millis() - lastDutyRxMillis);
+  }
+}
+
 void updateDisplay() {
+  if (!displayReady) {
+    return;
+  }
   if (millis() - lastDisplayUpdate < DISPLAY_INTERVAL_MS) {
     return;
   }
@@ -189,13 +293,12 @@ void updateDisplay() {
 }
 
 void setup() {
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, HIGH); // off (active-LOW)
-
   Serial.begin(115200);
   delay(200);
   Serial.println(F("\nRELAY_PWM_8266 booting..."));
   Serial.println(F("8 extra Art-Net channels for MULTIPLEX_8266 -- see its ARTNET_CONTROL.md"));
+
+  bootFlashStatusLed();
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID); // open network; the core retries/reconnects on its own
@@ -219,16 +322,16 @@ void setup() {
     setChannel(i, 0);
   }
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+  // Deliberately NOT fatal: a missing or miswired OLED costs us the bar
+  // graph, nothing else. Hanging here (as this used to) also stops the
+  // heartbeat, which the primary can only report as "RELAY_PWM_8266
+  // disconnected" -- pointing at the Wi-Fi link for what is actually an I2C
+  // fault. scanI2CBus() above already listed what really answered.
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!displayReady) {
     Serial.println(F("SSD1306 init FAILED - check OLED_ADDR and wiring"));
-    // Distinct fast blink (vs the 500ms heartbeat) signals init failure even
-    // without a Serial Monitor attached.
-    while (true) {
-      digitalWrite(STATUS_LED_PIN, LOW);
-      delay(100);
-      digitalWrite(STATUS_LED_PIN, HIGH);
-      delay(100);
-    }
+    Serial.println(F("Continuing without the display; PWM channels are unaffected."));
+    return;
   }
   Serial.println(F("SSD1306 init OK"));
 
@@ -257,6 +360,7 @@ void loop() {
   logWifiStatusChange();
   pollLink();
   sendLinkHeartbeatIfDue();
-  updateHeartbeat();
+  updateStatusLed();
+  printStatusReport();
   updateDisplay();
 }
