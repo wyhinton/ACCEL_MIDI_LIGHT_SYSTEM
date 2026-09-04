@@ -173,7 +173,7 @@
     {
       "label": "Quick Commit & Push",
       "type": "shell",
-      "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
+      "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push -u origin HEAD }",
       "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
