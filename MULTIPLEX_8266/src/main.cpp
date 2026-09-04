@@ -474,8 +474,8 @@ static const uint8_t EFFECT_LOCAL_PINS[4] = {MOSFET_PIN_C, MOSFET_PIN_A, MOSFET_
 // on each ~10ms poll tick and writes it out -- locally via analogWrite, the
 // extender's and RELAY_PWM_8266's channels each streamed over their own
 // [0xAC][channel][duty] link frame.
-static const unsigned long EFFECT_FADE_IN_MS = 250;
-static const unsigned long EFFECT_FADE_OUT_MS = 250;
+static const unsigned long EFFECT_FADE_IN_MS = 0;
+static const unsigned long EFFECT_FADE_OUT_MS = 0;
 
 struct EffectFade {
   uint16_t startDuty;   // duty when the current ramp began
