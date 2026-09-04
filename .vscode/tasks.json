@@ -162,6 +162,15 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Debug Log over WiFi (Mac)",
+      "type": "shell",
+      "command": "nc",
+      "args": ["192.168.4.1", "23"],
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Quick Commit & Push",
       "type": "shell",
       "command": "git add -A; if ($?) { git commit -m '${input:commitMessage}' }; if ($?) { git push }",
