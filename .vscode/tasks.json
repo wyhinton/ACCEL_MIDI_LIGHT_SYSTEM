@@ -31,6 +31,15 @@
       "presentation": { "panel": "dedicated", "clear": true }
     },
     {
+      "label": "Erase Multiplex",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
       "label": "Upload to Extender",
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
@@ -44,6 +53,15 @@
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Erase Extender",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
       "presentation": { "panel": "dedicated", "clear": true }
@@ -71,6 +89,51 @@
       "type": "shell",
       "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Erase Midi Light",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload to Relay PWM",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Upload & Monitor Relay PWM",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Monitor Relay PWM",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
+      "problemMatcher": "$platformio",
+      "group": "build",
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Erase Relay PWM",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
       "presentation": { "panel": "dedicated", "clear": true }

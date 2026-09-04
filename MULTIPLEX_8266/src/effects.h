@@ -1,7 +1,7 @@
 // C ports of Q Light Controller Plus RGB matrix scripts
 // (resources/rgbscripts at qlcplus commit 25c41450), adapted for this rig:
-// the 7 MOSFET channels are treated as a width x 1 pixel strip, and each
-// script's packed-RGB pixel collapses to a PWM duty (0 = off,
+// the rig's EFFECT_CHANNELS relays are treated as a width x 1 pixel strip,
+// and each script's packed-RGB pixel collapses to a PWM duty (0 = off,
 // EFFECT_DUTY_MAX = full on, same 0-1023 range as main.cpp's PWM_MAX).
 //
 // Ported so far: onebyone.js (Jano Svitok), fill.js / fillunfill.js
@@ -11,11 +11,12 @@
 //
 // Driven by main.cpp's effects test mode (serial key 'e'): each frame sets
 // per-channel fade targets, and the fade engine ramps every channel toward
-// its target -- locals via analogWrite, extender channels streamed over the
-// [0xAC][channel][duty] link frame. Intermediate duty levels are fully
-// supported end to end, so future ports of effects with trails/fades
-// (starfield, verticalfall, ...) can emit any 0..EFFECT_DUTY_MAX value.
-// The effects here all emit plain 0 or EFFECT_DUTY_MAX per channel.
+// its target -- locals via analogWrite, satellite channels (extender,
+// RELAY_PWM_8266) each streamed over their own [0xAC][channel][duty] link
+// frame. Intermediate duty levels are fully supported end to end, so future
+// ports of effects with trails/fades (starfield, verticalfall, ...) can
+// emit any 0..EFFECT_DUTY_MAX value. The effects here all emit plain 0 or
+// EFFECT_DUTY_MAX per channel.
 
 #pragma once
 
