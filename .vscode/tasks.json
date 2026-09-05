@@ -6,7 +6,8 @@
     {
       "label": "Upload to Multiplex",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -15,7 +16,8 @@
     {
       "label": "Upload & Monitor Multiplex",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -24,7 +26,8 @@
     {
       "label": "Monitor Multiplex",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -33,7 +36,8 @@
     {
       "label": "Erase Multiplex",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MULTIPLEX_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -42,7 +46,8 @@
     {
       "label": "Upload to Extender",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -51,7 +56,8 @@
     {
       "label": "Upload & Monitor Extender",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -60,7 +66,8 @@
     {
       "label": "Erase Extender",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MOSFET_EXTENDER_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -69,7 +76,8 @@
     {
       "label": "Upload to Midi Light",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -78,7 +86,8 @@
     {
       "label": "Upload & Monitor Midi Light",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -87,7 +96,8 @@
     {
       "label": "Monitor Midi Light",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -96,7 +106,8 @@
     {
       "label": "Erase Midi Light",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/MIDI_NOTE_LIGHT_REAL"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -105,7 +116,8 @@
     {
       "label": "Upload to Relay PWM",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -114,7 +126,8 @@
     {
       "label": "Upload & Monitor Relay PWM",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "upload", "--target", "monitor", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -123,7 +136,8 @@
     {
       "label": "Monitor Relay PWM",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
       "problemMatcher": "$platformio",
       "group": "build",
@@ -132,7 +146,8 @@
     {
       "label": "Erase Relay PWM",
       "type": "shell",
-      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+      "command": "${workspaceFolder}/.vscode/scripts/pio.sh",
+      "windows": { "command": "${workspaceFolder}/.vscode/scripts/pio.bat" },
       "args": ["run", "--target", "erase", "--project-dir", "${workspaceFolder}/RELAY_PWM_8266"],
       "problemMatcher": "$platformio",
       "group": "build",

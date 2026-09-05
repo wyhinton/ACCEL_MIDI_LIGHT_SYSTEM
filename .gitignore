@@ -1,0 +1,11 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Node (LIGHT_CHASE_UI)
+node_modules/
+dist/
