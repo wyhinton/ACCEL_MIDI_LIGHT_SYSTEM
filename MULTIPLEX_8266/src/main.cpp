@@ -114,16 +114,18 @@ static const uint8_t MOSFET_PIN_D = 15; // D8
 // SoftwareSerial link (not the hardware UART, so USB debug output keeps
 // working over the USB cable), and RELAY_PWM_8266 driving eight PCA9685 PWM
 // channels wirelessly, as a Wi-Fi station on this board's own SoftAP. Both
-// speak the same [0xAC sync][channel][duty 0-255] duty-command framing and
 // send a heartbeat back on their own schedule so a LinkMonitor can tell
-// whether each is actually connected -- just over different transports
-// (serial bytes for the extender, UDP datagrams for RELAY_PWM_8266).
+// whether each is actually connected, but their duty framing differs with
+// the transport: the extender gets a [0xAC][channel][duty] frame per changed
+// channel over serial, while RELAY_PWM_8266 gets all eight channels at once
+// in a [0xAB][duty x8] UDP datagram (see the send functions below for why).
 static const uint8_t LINK_RX_PIN = 12; // D6, from extender TX
 static const uint8_t LINK_TX_PIN = 14; // D5, to extender RX (wire crossed, shared GND)
 static const uint32_t LINK_BAUD = 9600;
 SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN);
 
-static const uint8_t LINK_DUTY_SYNC_BYTE = 0xAC;
+static const uint8_t LINK_DUTY_SYNC_BYTE = 0xAC;   // extender, one channel per frame
+static const uint8_t RELAY_STATE_SYNC_BYTE = 0xAB; // RELAY_PWM_8266, all 8 channels per frame
 
 // RELAY_PWM_8266's Wi-Fi side of the link: it joins this board's SoftAP as a
 // station and the two exchange UDP datagrams. Its IP isn't fixed -- DHCP
@@ -188,15 +190,6 @@ void updateLinkMonitor(LinkMonitor &m, bool gotContact) {
   }
 }
 
-// Forces every RELAY_PWM_8266 channel to be resent next fade tick regardless
-// of whether its duty actually changed -- needed because that board zeroes
-// its own outputs on boot, and our send-only-on-change throttle otherwise
-// has no reason to repeat whatever duty was already current when it
-// (re)joined, leaving it stuck dark until the next real Art-Net change.
-// Defined near updateEffectFades(); forward-declared here since
-// updateLinkStatus() runs the reconnect check that calls it.
-void resendAllRelayDuty();
-
 void updateLinkStatus() {
   bool extenderGotByte = false;
   while (linkSerial.available()) {
@@ -213,12 +206,11 @@ void updateLinkStatus() {
     relayIpKnown = true;
     relayGotPacket = true;
   }
-  bool relayWasUp = (relayLinkMonitor.state == LINK_UP);
+  // No "catch it up on reconnect" hook needed: the duty sender below repeats
+  // the full channel state on a fixed refresh regardless of whether anything
+  // changed, so a board that (re)joins is back in sync within one refresh
+  // whether we noticed the transition or not.
   updateLinkMonitor(relayLinkMonitor, relayGotPacket);
-  if (relayGotPacket && !relayWasUp) {
-    dbgPrintln("[LINK] RELAY_PWM_8266 (re)joined -- resending current channel state");
-    resendAllRelayDuty();
-  }
 }
 
 // ---- PC audio level stream ------------------------------------------------
@@ -503,27 +495,40 @@ void setEffectTarget(uint8_t channel, uint16_t target) {
   f.durationMs = (target > f.currentDuty) ? EFFECT_FADE_IN_MS : EFFECT_FADE_OUT_MS;
 }
 
-// Neither satellite's channels can be PWM-addressed by a single frame per
-// channel without cost -- e.g. a full 3-channel extender update is 9 bytes
-// (~9ms of blocking SoftwareSerial TX at 9600 baud), and every RELAY_PWM_8266
-// channel change is its own UDP packet -- so writes are throttled and
-// only-on-change. lastSentRelayDuty uses -1 (never a real 0-255 duty) as
-// "unknown" so resendAllRelayDuty() (see updateLinkStatus()) can force a
-// resend without needing a separate "known" flag per channel.
+// The extender's channels each cost a frame of blocking SoftwareSerial TX
+// (a full 3-channel update is 9 bytes, ~9ms at 9600 baud), so its writes stay
+// throttled and only-on-change.
 static const unsigned long LINK_DUTY_INTERVAL_MS = 30;
 static unsigned long lastLinkDutyMillis = 0;
 static uint8_t lastSentExtenderDuty[3] = {0, 0, 0};
-static int16_t lastSentRelayDuty[RELAY_CHANNEL_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1};
+
+// RELAY_PWM_8266 is paced separately, and deliberately so: sharing one window
+// with the extender meant its ~9ms of blocking serial TX sat in front of
+// these UDP sends and jittered them.
+//
+// Its 8 channels also go out as one [0xAB][duty x8] datagram rather than a
+// packet per changed channel. Eight separate packets cost eight lots of
+// UDP/IP header and 802.11 framing to carry 24 payload bytes; one 9-byte
+// packet carries the same information for roughly a seventh of the airtime,
+// and less airtime is itself less packet loss. The bigger win is that a
+// full-state packet is self-correcting -- any one that arrives resyncs every
+// channel. The old scheme recorded a channel as sent the moment it reached
+// endPacket(), so a datagram lost in the air (routine on an ESP8266 SoftAP)
+// left that lamp holding a stale level until its value happened to change
+// again, which is what "sticky" PCA channels actually were.
+//
+// Hence two intervals: MIN spaces out change-driven sends so a burst of
+// Art-Net can't flood the air, and REFRESH repeats the current state even
+// when nothing changed, so any lost packet is corrected within one refresh
+// (and a satellite that reboots or rejoins catches up on its own).
+static const unsigned long RELAY_DUTY_MIN_INTERVAL_MS = 10;
+static const unsigned long RELAY_DUTY_REFRESH_MS = 100;
+static unsigned long lastRelayDutyMillis = 0;
+static uint8_t lastSentRelayDuty[RELAY_CHANNEL_COUNT] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 // Last level actually written to each local pin (after the audio scale), so
 // a write only costs an analogWrite when the value really changed.
 static uint16_t lastLocalOut[4] = {0, 0, 0, 0};
-
-void resendAllRelayDuty() {
-  for (uint8_t i = 0; i < RELAY_CHANNEL_COUNT; i++) {
-    lastSentRelayDuty[i] = -1;
-  }
-}
 
 // Sends [0xAC][channel][duty8] to the extender over its serial link if
 // duty8 actually changed since the last send.
@@ -538,26 +543,36 @@ void sendExtenderChannelDutyIfChanged(uint8_t channel, uint8_t duty8, bool dutyW
   sentAny = true;
 }
 
-// Same [0xAC][channel][duty8] framing, sent as a UDP datagram to
-// RELAY_PWM_8266 instead of serial bytes. A silent no-op until relayIp is
-// known (it hasn't sent its first heartbeat yet); resendAllRelayDuty()
-// catches it up once it does.
-void sendRelayChannelDutyIfChanged(uint8_t channel, uint8_t duty8, bool dutyWindowOpen, bool &sentAny) {
-  if (!relayIpKnown || !dutyWindowOpen || (int16_t)duty8 == lastSentRelayDuty[channel]) {
+// Sends all 8 RELAY_PWM_8266 channels as one [0xAB][duty x8] UDP datagram.
+void sendRelayState(const uint8_t duty[RELAY_CHANNEL_COUNT]) {
+  relayUdp.beginPacket(relayIp, RELAY_DUTY_PORT);
+  relayUdp.write(RELAY_STATE_SYNC_BYTE);
+  relayUdp.write(duty, RELAY_CHANNEL_COUNT);
+  relayUdp.endPacket();
+  memcpy(lastSentRelayDuty, duty, RELAY_CHANNEL_COUNT);
+  lastRelayDutyMillis = millis();
+}
+
+// Sends that state when there's something new to say (rate-limited), or when
+// the refresh falls due (see the interval constants above). A silent no-op
+// until relayIp is known -- the satellite hasn't sent its first heartbeat
+// yet, so we don't know where to address the packet.
+void sendRelayStateIfDue(const uint8_t duty[RELAY_CHANNEL_COUNT]) {
+  if (!relayIpKnown) {
     return;
   }
-  relayUdp.beginPacket(relayIp, RELAY_DUTY_PORT);
-  relayUdp.write(LINK_DUTY_SYNC_BYTE);
-  relayUdp.write(channel);
-  relayUdp.write(duty8);
-  relayUdp.endPacket();
-  lastSentRelayDuty[channel] = duty8;
-  sentAny = true;
+  unsigned long sinceLastMs = millis() - lastRelayDutyMillis;
+  bool changed = memcmp(duty, lastSentRelayDuty, RELAY_CHANNEL_COUNT) != 0;
+  if ((changed && sinceLastMs >= RELAY_DUTY_MIN_INTERVAL_MS) ||
+      sinceLastMs >= RELAY_DUTY_REFRESH_MS) {
+    sendRelayState(duty);
+  }
 }
 
 void updateEffectFades() {
   bool dutyWindowOpen = millis() - lastLinkDutyMillis >= LINK_DUTY_INTERVAL_MS;
   bool sentAny = false;
+  uint8_t relayDuty[RELAY_CHANNEL_COUNT]; // filled by channels 7-14 below, sent as one frame
   for (uint8_t i = 0; i < EFFECT_CHANNELS; i++) {
     EffectFade &f = effectFades[i];
     uint16_t duty;
@@ -579,13 +594,13 @@ void updateEffectFades() {
       uint8_t duty8 = (uint8_t)((uint32_t)out * 255 / PWM_MAX);
       sendExtenderChannelDutyIfChanged(i - 4, duty8, dutyWindowOpen, sentAny);
     } else {
-      uint8_t duty8 = (uint8_t)((uint32_t)out * 255 / PWM_MAX);
-      sendRelayChannelDutyIfChanged(i - 7, duty8, dutyWindowOpen, sentAny);
+      relayDuty[i - 7] = (uint8_t)((uint32_t)out * 255 / PWM_MAX);
     }
   }
   if (sentAny) {
     lastLinkDutyMillis = millis();
   }
+  sendRelayStateIfDue(relayDuty);
 }
 
 // ---- Pattern selection (not currently wired to Art-Net) -------------------

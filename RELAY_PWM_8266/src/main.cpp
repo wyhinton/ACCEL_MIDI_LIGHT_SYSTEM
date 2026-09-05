@@ -7,10 +7,8 @@
 // fixture (its channels 8-15), driven over PWM by the PCA9685. It doesn't
 // speak Art-Net itself, and there's no wire to MULTIPLEX_8266 either: this
 // board joins MULTIPLEX_8266's own SoftAP as a Wi-Fi station (the same
-// open network QLC+ joins for Art-Net), and the two exchange
-// [0xAC sync][channel 0-7][duty 0-255] duty commands and heartbeat bytes as
-// UDP datagrams instead of serial bytes -- the same framing MULTIPLEX_8266
-// already uses for MOSFET_EXTENDER_8266's wired channels. See
+// open network QLC+ joins for Art-Net), and the two exchange duty commands
+// and heartbeat bytes as UDP datagrams instead of serial bytes. See
 // MULTIPLEX_8266's ARTNET_CONTROL.md for how QLC+ addresses the combined
 // fixture.
 
@@ -62,10 +60,21 @@ static const uint16_t RELAY_DUTY_PORT = 7779;      // MULTIPLEX_8266 -> this boa
 static const uint8_t LINK_CHANNEL_COUNT = 8;
 WiFiUDP linkUdp;
 
-// [0xAC sync][channel 0-7][duty 0-255], one per UDP packet -- streamed
-// continuously by the primary's effects fade engine as each channel ramps.
+// Two duty framings are accepted. [0xAB sync][duty 0-255 x8] is what the
+// primary sends now: one packet carries the complete state of all 8
+// channels, so a datagram lost to Wi-Fi is fully corrected by the next one
+// rather than stranding a lamp at a stale level (which is exactly what the
+// old per-channel framing did, since the primary marked a channel "sent"
+// the moment it handed the packet to UDP and then never repeated it).
+//
+// [0xAC sync][channel 0-7][duty 0-255] is that older single-channel frame,
+// still accepted so this board can be flashed before or after the primary
+// without the link going quiet in between. Once both boards are on the new
+// firmware nothing sends it any more and it can be dropped.
+//
 // UDP already frames the packet, so unlike a byte-stream link there's no
 // resync state machine needed: a short or malformed packet is just dropped.
+static const uint8_t LINK_STATE_SYNC_BYTE = 0xAB;
 static const uint8_t LINK_DUTY_SYNC_BYTE = 0xAC;
 
 // Sent back to the primary on its own schedule (independent of command
@@ -119,12 +128,11 @@ void logWifiStatusChange() {
 //     board says it locally, in a pattern deliberately unlike every other
 //     LED state here.
 //   - Joined: flashes rapidly for 1s at boot, then toggles once per
-//     incoming duty packet (see pollLink()) as a link-activity indicator --
-//     same as MULTIPLEX_8266's Art-Net LED, just fed by the relayed
-//     [0xAC][channel][duty] packets this board actually receives. Solid and
-//     unchanging means no fresh data since the last toggle (expected while
-//     a scene holds, since the primary only sends on change); flickering
-//     means the link is actively delivering updates.
+//     incoming duty packet (see pollLink()) as a link-activity indicator.
+//     The primary refreshes the full channel state on a steady cadence
+//     rather than only on change, so this settles into a continuous blink
+//     whenever the link is healthy -- an LED that stops moving means duty
+//     packets have stopped arriving, not that the scene is simply holding.
 static const uint8_t STATUS_LED_PIN = LED_BUILTIN;
 static bool statusLedOn = true; // matches the solid-on state bootFlashStatusLed() leaves it in
 
@@ -189,29 +197,44 @@ void setChannel(uint8_t channel, uint16_t brightness) {
   channelLevels[channel] = brightness;
 }
 
-// Applies one [0xAC][channel][duty] frame's raw duty (0-255) to the PCA9685,
-// scaled up to its 0-4095 PWM range.
+// Applies one channel's raw duty (0-255) from a duty frame to the PCA9685,
+// scaled up to its 0-4095 PWM range. Skips the I2C write when the channel is
+// already sitting at that level: full-state frames arrive continuously now,
+// including refreshes where nothing moved, so without this guard the bus
+// would carry 8 register writes per packet no matter what.
 void handleLinkChannelDuty(uint8_t channel, uint8_t duty8) {
   uint16_t brightness = (uint16_t)((uint32_t)duty8 * 4095 / 255);
+  if (channelLevels[channel] == brightness) {
+    return;
+  }
   setChannel(channel, brightness);
 }
 
-// Applies every complete [0xAC][channel 0-7][duty 0-255] packet waiting on
-// the link. A packet that's too short, doesn't start with the sync byte, or
-// names a channel we don't have is just dropped -- UDP already guarantees
-// each read is one whole datagram (or none), so there's no partial-frame
-// state to track like a byte-stream link would need.
+// Applies every complete duty packet waiting on the link, in either framing
+// (see the sync byte constants above). A packet that's too short, doesn't
+// start with a sync byte we know, or names a channel we don't have is just
+// dropped -- UDP already guarantees each read is one whole datagram (or
+// none), so there's no partial-frame state to track like a byte-stream link
+// would need.
 void pollLink() {
   while (linkUdp.parsePacket() > 0) {
-    uint8_t buf[3];
+    uint8_t buf[1 + LINK_CHANNEL_COUNT];
     int len = linkUdp.read(buf, sizeof(buf));
-    if (len < 3 || buf[0] != LINK_DUTY_SYNC_BYTE || buf[1] >= LINK_CHANNEL_COUNT) {
+    if (len < 1) {
       continue;
+    }
+    if (buf[0] == LINK_STATE_SYNC_BYTE && len >= 1 + LINK_CHANNEL_COUNT) {
+      for (uint8_t ch = 0; ch < LINK_CHANNEL_COUNT; ch++) {
+        handleLinkChannelDuty(ch, buf[1 + ch]);
+      }
+    } else if (buf[0] == LINK_DUTY_SYNC_BYTE && len >= 3 && buf[1] < LINK_CHANNEL_COUNT) {
+      handleLinkChannelDuty(buf[1], buf[2]);
+    } else {
+      continue; // not a duty frame we understand
     }
     dutyPacketCount++;
     lastDutyRxMillis = millis();
     toggleStatusLed();
-    handleLinkChannelDuty(buf[1], buf[2]);
   }
 }
 
