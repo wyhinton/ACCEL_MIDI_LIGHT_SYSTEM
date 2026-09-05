@@ -33,6 +33,13 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define OLED_ADDR 0x3C
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
+// OLED is physically disconnected for now (its VCC/ground wiring was
+// implicated in a heat/power issue seen when the 12V supply was also
+// connected -- see project notes). Flip back to true once it's rewired and
+// reconnected; everything else (PCA9685 channels, the Wi-Fi link) doesn't
+// depend on it.
+static const bool OLED_ATTACHED = false;
+
 // Whether display.begin() actually succeeded. The OLED is a diagnostic
 // nicety -- driving the PCA9685 channels is this board's real job -- so a
 // dead/miswired display must not stop us from serving the link (it used to
@@ -257,12 +264,12 @@ void printStatusReport() {
     // 1 = SSID not found (primary's AP is down), 4 = auth/assoc failed,
     // 6 = disconnected/still trying.
     Serial.printf("[STATUS] wifi: NOT connected to %s (status %d) | oled: %s\n",
-                  WIFI_SSID, (int)WiFi.status(), displayReady ? "ok" : "FAILED");
+                  WIFI_SSID, (int)WiFi.status(), OLED_ATTACHED ? (displayReady ? "ok" : "FAILED") : "disabled");
     return;
   }
   Serial.printf("[STATUS] wifi: %s as %s | oled: %s | duty packets: %lu",
                 WIFI_SSID, WiFi.localIP().toString().c_str(),
-                displayReady ? "ok" : "FAILED", dutyPacketCount);
+                OLED_ATTACHED ? (displayReady ? "ok" : "FAILED") : "disabled", dutyPacketCount);
   if (dutyPacketCount == 0) {
     Serial.println(F(" (none yet -- primary hasn't sent any)"));
   } else {
@@ -320,6 +327,11 @@ void setup() {
   // Start all outputs off
   for (int i = 0; i < NUM_CHANNELS; i++) {
     setChannel(i, 0);
+  }
+
+  if (!OLED_ATTACHED) {
+    Serial.println(F("OLED disabled in firmware (physically disconnected) -- skipping init"));
+    return;
   }
 
   // Deliberately NOT fatal: a missing or miswired OLED costs us the bar
