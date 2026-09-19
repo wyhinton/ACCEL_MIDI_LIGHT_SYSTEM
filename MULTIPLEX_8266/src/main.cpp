@@ -25,8 +25,11 @@
 // light-order map below), each an independent 0-255 brightness. Channels
 // 1-7 are the 4 local MOSFETs plus the 3 on the extender board; channels
 // 8-15 are the 8 PCA9685 PWM outputs on the wireless RELAY_PWM_8266 board.
-// See ARTNET_CONTROL.md for how to point QLC+ at the board. There is no
-// serial control interface -- USB serial is log output only.
+// The board answers ArtPoll and accepts ArtAddress, so any Art-Net console
+// (MagicQ, QLC+, ...) can find it and set its Net/Sub-Net/Universe from its
+// own node list -- no reflash needed to change which universe it listens
+// on. See ARTNET_CONTROL.md for how to point a console at the board. There
+// is no serial control interface -- USB serial is log output only.
 //
 // A pattern engine (effects.h ports, e.g. chases/fills) also lives in this
 // file but isn't wired to Art-Net right now -- see the "Pattern selection"
@@ -237,7 +240,8 @@ static unsigned long lastAudioRxMillis = 0;
 // rather than TCP because the audio stream is fire-and-forget: a lost
 // packet just means the next one, ~16ms later, lands instead -- no
 // reconnect logic to get stuck.
-static const char *AP_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
+static const char *AP_SSID = "MULTIPLEX_LIGHTS";
+static const char *AP_PASSWORD = "LIGHTS123"; // WPA2, 8+ chars required
 static const uint16_t AUDIO_UDP_PORT = 7777;
 WiFiUDP audioUdp;
 static bool apActive = false; // set once in setupWifi(); read by the status report
@@ -247,6 +251,21 @@ static bool apActive = false; // set once in setupWifi(); read by the status rep
 // (or broadcast to the AP subnet). See the Art-Net section below.
 static const uint16_t ARTNET_PORT = 6454;
 WiFiUDP artnetUdp;
+
+// This node's 15-bit Port-Address (Net 0-127 : Sub-Net 0-15 : Universe
+// 0-15) -- which universe it listens to for ArtDmx. Declared up here
+// (rather than down in the "Art-Net node addressing" section where the rest
+// of that logic lives) because setupWifi()'s boot log reads it before that
+// section appears later in the file -- see there for what sets/persists it.
+static uint8_t artnetNet = 0;
+static uint8_t artnetSubUni = 0;
+static uint8_t artnetUniverse = 0;
+// ArtPollReply is sent broadcast (the spec's recommended target, so every
+// controller on the network sees it, not just whichever one happened to
+// poll) to the SoftAP's fixed /24 subnet -- the ESP8266 core always hands
+// itself 192.168.4.1 in AP mode, so this is stable without a getter for the
+// AP's subnet mask.
+static const IPAddress ARTNET_BROADCAST_IP(192, 168, 4, 255);
 
 void onAudioLevel(uint8_t level) {
   audioLevel = level;
@@ -290,18 +309,21 @@ uint16_t scaleDuty(uint16_t duty) {
 void setupWifi() {
   WiFi.persistent(false); // don't re-burn the same AP config to flash every boot
   WiFi.mode(WIFI_AP);
-  apActive = WiFi.softAP(AP_SSID); // no password = open AP
+  apActive = WiFi.softAP(AP_SSID, AP_PASSWORD);
   audioUdp.begin(AUDIO_UDP_PORT);
   artnetUdp.begin(ARTNET_PORT);
   relayUdp.begin(RELAY_HEARTBEAT_PORT);
   debugServer.begin();
   debugServer.setNoDelay(true);
   if (apActive) {
-    dbgPrintf("[AUDIO] SoftAP '%s' (open) up -- level frames to %s:%u/udp\n",
+    dbgPrintf("[AUDIO] SoftAP '%s' (WPA2) up -- level frames to %s:%u/udp\n",
                   AP_SSID, WiFi.softAPIP().toString().c_str(), (unsigned)AUDIO_UDP_PORT);
-    dbgPrintf("[ARTNET] listening on :%u/udp -- point QLC+'s Art-Net output at %s (or broadcast)\n",
+    dbgPrintf("[ARTNET] listening on :%u/udp -- point MagicQ/QLC+'s Art-Net output at %s (or broadcast)\n",
                   (unsigned)ARTNET_PORT, WiFi.softAPIP().toString().c_str());
     dbgPrintln("[ARTNET] once joined to the SoftAP; channels 1-15 = one brightness per relay");
+    dbgPrintf("[ARTNET] node address Net %u / Sub-Net %u / Universe %u -- discoverable via ArtPoll, "
+                  "reassignable from the console's node list (ArtAddress)\n",
+                  (unsigned)artnetNet, (unsigned)artnetSubUni, (unsigned)artnetUniverse);
     dbgPrintf("[RELAY] waiting for RELAY_PWM_8266 to join the SoftAP and heartbeat on :%u/udp\n",
                   (unsigned)RELAY_HEARTBEAT_PORT);
     dbgPrintf("[DEBUG] telnet mirror on :%u -- run: telnet %s %u\n",
@@ -648,14 +670,73 @@ void applyPatternFrame(uint8_t brightness, uint8_t patternRaw) {
   }
 }
 
+// ---- Art-Net node addressing (ArtAddress / ArtPoll / ArtPollReply) --------
+// Which 15-bit Port-Address (Net 0-127 : Sub-Net 0-15 : Universe 0-15) this
+// board listens on for ArtDmx (artnetNet/artnetSubUni/artnetUniverse,
+// declared up with artnetUdp so setupWifi()'s boot log can read them before
+// this section of the file). Defaults to 0/0/0 -- "Universe 1" in most
+// consoles' 1-based UI -- but can be reassigned from the console itself:
+// MagicQ/QLC+ discover the node via ArtPoll/ArtPollReply (Setup > View
+// Nodes or equivalent) and push a new address with ArtAddress, same as any
+// commercial Art-Net node. This is the standard Art-Net way to give the
+// fixture a "start address" -- it's node-level (which universe), not an
+// arbitrary in-universe channel offset: the fixture always occupies
+// channels 1-15 of whichever universe it's configured for. For a finer
+// per-fixture offset within a shared universe, use the console's own patch
+// (its start-address field sends the fixture's data at that offset within
+// the universe it already receives in full).
+
+// EEPROM layout (same 32-byte sector as the light-order map above, right
+// after its magic+version+15 bytes+checksum which end at offset 18):
+// [19]='A' [20]='N' [21]=net [22]=subUni [23]=universe [24]=checksum
+static const size_t ARTNET_ADDR_EEPROM_OFFSET = 3 + EFFECT_CHANNELS + 1; // 19
+static const uint8_t ARTNET_ADDR_MAGIC_0 = 'A';
+static const uint8_t ARTNET_ADDR_MAGIC_1 = 'N';
+
+uint8_t artnetAddrChecksum(uint8_t net, uint8_t sub, uint8_t uni) {
+  return (uint8_t)(0xA5 ^ net ^ (sub * 17) ^ (uni * 31));
+}
+
+void loadArtnetAddress() {
+  size_t o = ARTNET_ADDR_EEPROM_OFFSET;
+  bool valid = EEPROM.read(o) == ARTNET_ADDR_MAGIC_0 && EEPROM.read(o + 1) == ARTNET_ADDR_MAGIC_1;
+  uint8_t net = 0, sub = 0, uni = 0;
+  if (valid) {
+    net = EEPROM.read(o + 2);
+    sub = EEPROM.read(o + 3);
+    uni = EEPROM.read(o + 4);
+    valid = net <= 0x7F && sub <= 0x0F && uni <= 0x0F &&
+            EEPROM.read(o + 5) == artnetAddrChecksum(net, sub, uni);
+  }
+  if (valid) {
+    artnetNet = net;
+    artnetSubUni = sub;
+    artnetUniverse = uni;
+  }
+  dbgPrintf("[ARTNET] node address: Net %u / Sub-Net %u / Universe %u%s\n", (unsigned)artnetNet,
+            (unsigned)artnetSubUni, (unsigned)artnetUniverse, valid ? " (loaded from EEPROM)" : " (default)");
+}
+
+void saveArtnetAddress() {
+  size_t o = ARTNET_ADDR_EEPROM_OFFSET;
+  EEPROM.write(o, ARTNET_ADDR_MAGIC_0);
+  EEPROM.write(o + 1, ARTNET_ADDR_MAGIC_1);
+  EEPROM.write(o + 2, artnetNet);
+  EEPROM.write(o + 3, artnetSubUni);
+  EEPROM.write(o + 4, artnetUniverse);
+  EEPROM.write(o + 5, artnetAddrChecksum(artnetNet, artnetSubUni, artnetUniverse));
+  EEPROM.commit();
+}
+
 // ---- Art-Net DMX control ---------------------------------------------
 // A minimal ArtDMX receiver, one channel per relay: DMX channel N (1-based)
 // is the lamp at physical position N-1 -- i.e. it goes through the same
 // light-order map as everything else, so channel 1 is always "the first
-// lamp in the row" regardless of which pin actually drives it. No universe
-// filtering yet: whichever Art-Net universe QLC+ is configured to send,
-// channels 1-15 of it are read. There's no timeout hand-back -- losing the
-// Art-Net stream leaves the relays holding their last commanded state.
+// lamp in the row" regardless of which pin actually drives it. Only ArtDmx
+// packets addressed to this node's configured Net/Sub-Net/Universe (see
+// above) are applied; everything else on the port is ignored. There's no
+// timeout hand-back -- losing the Art-Net stream leaves the relays holding
+// their last commanded state.
 static bool artnetActive = false;
 static unsigned long lastArtnetRxMillis = 0;
 static uint8_t artnetLevels[EFFECT_CHANNELS] = {0}; // DMX channels 1-15, by position
@@ -689,32 +770,140 @@ void onArtnetDmx(const uint8_t levels[EFFECT_CHANNELS]) {
 // header so a stray UDP packet on this port can't be misread as a DMX
 // frame. A packet shorter than 15 channels is still applied, with whichever
 // trailing channels are missing treated as 0 (off).
+//
+// Two more opcodes are handled for node discovery/addressing (see the
+// "Art-Net node addressing" section above): OpPoll (0x2000), which every
+// console broadcasts to find nodes on the network, gets an OpPollReply
+// (0x2100) back describing this node and its current address; OpAddress
+// (0x6000) is how a console pushes a new Net/Sub-Net/Universe down to a
+// node it found that way (MagicQ's/QLC+'s node list, not a custom tool).
 static const uint16_t ARTNET_OPCODE_DMX = 0x5000;
-static const size_t ARTNET_HEADER_LEN = 18; // through the two length bytes
+static const uint16_t ARTNET_OPCODE_POLL = 0x2000;
+static const uint16_t ARTNET_OPCODE_POLLREPLY = 0x2100;
+static const uint16_t ARTNET_OPCODE_ADDRESS = 0x6000;
+static const size_t ARTNET_HEADER_LEN = 18;      // OpDmx, through the two length bytes
+static const size_t ARTNET_ID_OPCODE_LEN = 10;   // ID[8] + OpCode[2] -- common to every packet type
+static const size_t ARTNET_ADDRESS_LEN = 107;    // OpAddress, through its Command byte
+static const size_t ARTNET_MAX_PACKET_LEN = 128; // covers every packet type parsed below
+
+// Replies to an OpPoll broadcast with this node's identity and current
+// address, so MagicQ/QLC+ list it under Setup > View Nodes (or their
+// equivalent) instead of requiring the IP to be typed in blind, and so their
+// "set node address" UI has something to target with OpAddress. Sent
+// broadcast per the spec's recommendation (see ARTNET_BROADCAST_IP above).
+// Field layout: Art-Net 4 ArtPollReply, 239 bytes, most of it zero-filled --
+// only what MagicQ/QLC+ actually read for the node list and address UI
+// (identity, IP, ShortName/LongName, NetSwitch/SubSwitch/SwOut, port count
+// and type, MAC) is filled in below; the rest (UBEA/ESTA codes, node report
+// text, status flags) legitimately has no value for a fixture this simple.
+void sendArtnetPollReply() {
+  uint8_t reply[239];
+  memset(reply, 0, sizeof(reply));
+  memcpy(reply, "Art-Net", 7);
+  reply[8] = (uint8_t)(ARTNET_OPCODE_POLLREPLY & 0xFF); // OpCode, little-endian
+  reply[9] = (uint8_t)(ARTNET_OPCODE_POLLREPLY >> 8);
+  IPAddress ip = WiFi.softAPIP();
+  reply[10] = ip[0];
+  reply[11] = ip[1];
+  reply[12] = ip[2];
+  reply[13] = ip[3];
+  reply[14] = (uint8_t)(ARTNET_PORT & 0xFF); // Port, little-endian (always 6454)
+  reply[15] = (uint8_t)(ARTNET_PORT >> 8);
+  reply[18] = artnetNet;                        // NetSwitch
+  reply[19] = artnetSubUni;                     // SubSwitch
+  strncpy((char *)&reply[26], "MULTIPLEX_8266", 17);            // ShortName, 18 bytes
+  strncpy((char *)&reply[44], "MULTIPLEX_8266 relay fixture", 63); // LongName, 64 bytes
+  reply[173] = 1;                               // NumPorts (low byte) -- one logical port
+  reply[174] = 0x80;                            // PortTypes[0]: output-capable, protocol DMX512
+  reply[182] = artnetActive ? 0x80 : 0x00;      // GoodOutput[0]: bit7 = data being output
+  reply[190] = artnetUniverse;                  // SwOut[0] -- this port's universe
+  reply[200] = 0x00;                            // Style: StNode (a standard Art-Net node)
+  WiFi.softAPmacAddress(&reply[201]);           // Mac[6]
+  reply[207] = ip[0];                           // BindIp -- same as this node's own IP
+  reply[208] = ip[1];
+  reply[209] = ip[2];
+  reply[210] = ip[3];
+  reply[211] = 1;                               // BindIndex
+  reply[212] = 0x08;                            // Status2: supports 15-bit Port-Address (Art-Net 3/4)
+
+  artnetUdp.beginPacket(ARTNET_BROADCAST_IP, ARTNET_PORT);
+  artnetUdp.write(reply, sizeof(reply));
+  artnetUdp.endPacket();
+}
+
+// Applies an OpAddress packet's NetSwitch/SubSwitch/SwOut[0] fields (the
+// only ones relevant to a single-port node like this) to the node's address
+// and persists it, so the change survives a reboot. Per the Art-Net spec,
+// NetSwitch/SubSwitch only take effect when their top "program" bit (0x80)
+// is set, and SwOut[0] == 0x7F means "leave this port's universe unchanged"
+// -- consoles send those sentinels when the user only touched one field in
+// the node's address dialog, so unrelated bytes in the same packet mustn't
+// stomp the others.
+void applyArtnetAddress(const uint8_t *buf, int len) {
+  if (len < (int)ARTNET_ADDRESS_LEN) {
+    return; // truncated/malformed -- ignore rather than read past the buffer
+  }
+  bool changed = false;
+  uint8_t netSwitch = buf[12];
+  if (netSwitch & 0x80) {
+    uint8_t net = netSwitch & 0x7F;
+    changed |= (net != artnetNet);
+    artnetNet = net;
+  }
+  uint8_t subSwitch = buf[104];
+  if (subSwitch & 0x80) {
+    uint8_t sub = subSwitch & 0x0F;
+    changed |= (sub != artnetSubUni);
+    artnetSubUni = sub;
+  }
+  uint8_t swOut0 = buf[100];
+  if (swOut0 != 0x7F) {
+    uint8_t uni = swOut0 & 0x0F;
+    changed |= (uni != artnetUniverse);
+    artnetUniverse = uni;
+  }
+  if (changed) {
+    saveArtnetAddress();
+    dbgPrintf("[ARTNET] address set to Net %u / Sub-Net %u / Universe %u (saved)\n", (unsigned)artnetNet,
+              (unsigned)artnetSubUni, (unsigned)artnetUniverse);
+  }
+  sendArtnetPollReply(); // consoles expect a fresh reply confirming the (possibly unchanged) address
+}
 
 void pollArtnetUdp() {
   while (artnetUdp.parsePacket() > 0) {
-    uint8_t buf[ARTNET_HEADER_LEN + EFFECT_CHANNELS]; // header + DMX channels 1-15
+    uint8_t buf[ARTNET_MAX_PACKET_LEN];
     int len = artnetUdp.read(buf, sizeof(buf));
-    if (len <= (int)ARTNET_HEADER_LEN) {
-      continue; // no DMX data at all
-    }
-    if (memcmp(buf, "Art-Net", 7) != 0 || buf[7] != 0) {
-      continue; // not an Art-Net packet
+    if (len < (int)ARTNET_ID_OPCODE_LEN || memcmp(buf, "Art-Net", 7) != 0 || buf[7] != 0) {
+      continue; // not a recognizable Art-Net packet
     }
     uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);
-    if (opcode != ARTNET_OPCODE_DMX) {
-      continue; // ignore ArtPoll and everything else we don't need yet
+    if (opcode == ARTNET_OPCODE_POLL) {
+      sendArtnetPollReply();
+    } else if (opcode == ARTNET_OPCODE_ADDRESS) {
+      applyArtnetAddress(buf, len);
+    } else if (opcode == ARTNET_OPCODE_DMX) {
+      if (len <= (int)ARTNET_HEADER_LEN) {
+        continue; // no DMX data at all
+      }
+      uint8_t pktNet = buf[15] & 0x7F;
+      uint8_t pktSubUni = buf[14]; // Sub-Net (high nibble) + Universe (low nibble)
+      if (pktNet != artnetNet || ((pktSubUni >> 4) & 0x0F) != artnetSubUni ||
+          (pktSubUni & 0x0F) != artnetUniverse) {
+        continue; // addressed to a different Net/Sub-Net/Universe than this node is set to
+      }
+      uint8_t levels[EFFECT_CHANNELS] = {0};
+      int available = len - (int)ARTNET_HEADER_LEN;
+      if (available > EFFECT_CHANNELS) {
+        available = EFFECT_CHANNELS;
+      }
+      for (int i = 0; i < available; i++) {
+        levels[i] = buf[ARTNET_HEADER_LEN + i];
+      }
+      onArtnetDmx(levels);
     }
-    uint8_t levels[EFFECT_CHANNELS] = {0};
-    int available = len - (int)ARTNET_HEADER_LEN;
-    if (available > EFFECT_CHANNELS) {
-      available = EFFECT_CHANNELS;
-    }
-    for (int i = 0; i < available; i++) {
-      levels[i] = buf[ARTNET_HEADER_LEN + i];
-    }
-    onArtnetDmx(levels);
+    // everything else (including our own ArtPollReply broadcasts looping
+    // back) is ignored
   }
 }
 
@@ -766,6 +955,8 @@ void printConnectionStatus() {
     dbgPrint(" | AP: down");
   }
 
+  dbgPrintf(" | addr: %u/%u/%u", (unsigned)artnetNet, (unsigned)artnetSubUni, (unsigned)artnetUniverse);
+
   if (audioActive) {
     formatAge(age, sizeof(age), lastAudioRxMillis);
     dbgPrintf(" | audio: active (level %u, %s)", (unsigned)audioLevel, age);
@@ -813,6 +1004,7 @@ void setup() {
 
   EEPROM.begin(MAP_EEPROM_SIZE);
   loadChannelMap();
+  loadArtnetAddress();
 
   setupWifi();
 

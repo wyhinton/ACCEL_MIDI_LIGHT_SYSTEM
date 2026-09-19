@@ -145,7 +145,8 @@ All three drop the ESP32-S3 projects and build the MOSFET rig instead. The
 shared skeleton across them:
 
 - **`MULTIPLEX_8266`** — primary NodeMCU. Drives 4 MOSFET channels directly
-  (GPIO 4/5/0/15) and hosts an open SoftAP, `MULTIPLEX_LIGHTS` @ `192.168.4.1`.
+  (GPIO 4/5/0/15) and hosts a WPA2 SoftAP, `MULTIPLEX_LIGHTS` @ `192.168.4.1`
+  (password `LIGHTS123`).
 - **`MOSFET_EXTENDER_8266`** — second NodeMCU driving 3 more MOSFETs, fed over
   a crossed SoftwareSerial link on GPIO 12/14 at 9600 baud. Framing is
   sync-byte based: `0xAA` per-channel on/off, `0xAB` all-channel brightness,
@@ -191,7 +192,7 @@ the board to confirm it is reachable.
 
 - **`RELAY_PWM_8266`** — NodeMCU with a PCA9685 16-channel PWM driver on I²C
   (GPIO 4/5) and an SSD1306 OLED. Notably it has **no wire to the primary at
-  all**: it joins `MULTIPLEX_LIGHTS` as a Wi-Fi station — the same open network
+  all**: it joins `MULTIPLEX_LIGHTS` as a Wi-Fi station — the same WPA2 network
   QLC+ is on — and the two exchange duty commands and heartbeats as UDP
   datagrams. It does not speak Art-Net itself.
 

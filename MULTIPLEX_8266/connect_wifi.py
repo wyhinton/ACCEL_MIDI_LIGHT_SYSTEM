@@ -2,11 +2,11 @@
 # requires-python = ">=3.9"
 # dependencies = []
 # ///
-"""Join the MULTIPLEX_8266 board's open Wi-Fi SoftAP from Windows, without
+"""Join the MULTIPLEX_8266 board's WPA2 Wi-Fi SoftAP from Windows, without
 digging through the Settings app each time.
 
-Drives the built-in `netsh wlan` CLI: writes a temporary open-network
-profile for the board's SSID, adds it, connects, then polls until Windows
+Drives the built-in `netsh wlan` CLI: writes a temporary network profile for
+the board's SSID/password, adds it, connects, then polls until Windows
 reports the link up (or times out). The profile is added in "manual" mode
 so Windows won't auto-rejoin the board's AP later and silently steal your
 internet connection -- see ARTNET_CONTROL.md, "the PC loses internet access
@@ -14,7 +14,7 @@ while connected unless it has a second network adapter."
 
 Examples:
   uv run connect_wifi.py                  # join MULTIPLEX_LIGHTS, ping the board
-  uv run connect_wifi.py --ssid OTHER_AP
+  uv run connect_wifi.py --ssid OTHER_AP --password OTHER_PASS
   uv run connect_wifi.py --list-interfaces
   uv run connect_wifi.py --scan
   uv run connect_wifi.py --disconnect
@@ -27,7 +27,8 @@ import tempfile
 import time
 from pathlib import Path
 
-DEFAULT_SSID = "MULTIPLEX_LIGHTS"  # AUDIO_AP_SSID in src/main.cpp
+DEFAULT_SSID = "MULTIPLEX_LIGHTS"  # AP_SSID in MULTIPLEX_8266/src/main.cpp
+DEFAULT_PASSWORD = "LIGHTS123"     # AP_PASSWORD in MULTIPLEX_8266/src/main.cpp
 BOARD_IP = "192.168.4.1"
 PROFILE_TEMPLATE = """<?xml version="1.0"?>
 <WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
@@ -42,10 +43,15 @@ PROFILE_TEMPLATE = """<?xml version="1.0"?>
     <MSM>
         <security>
             <authEncryption>
-                <authentication>open</authentication>
-                <encryption>none</encryption>
+                <authentication>WPA2PSK</authentication>
+                <encryption>AES</encryption>
                 <useOneX>false</useOneX>
             </authEncryption>
+            <sharedKey>
+                <keyType>passPhrase</keyType>
+                <protected>false</protected>
+                <keyMaterial>{password}</keyMaterial>
+            </sharedKey>
         </security>
     </MSM>
 </WLANProfile>
@@ -117,8 +123,8 @@ def current_state(iface):
     return "", ""
 
 
-def add_profile(ssid, iface):
-    xml = PROFILE_TEMPLATE.format(ssid=ssid)
+def add_profile(ssid, password, iface):
+    xml = PROFILE_TEMPLATE.format(ssid=ssid, password=password)
     with tempfile.NamedTemporaryFile(
         "w", suffix=".xml", delete=False, encoding="utf-8"
     ) as f:
@@ -149,6 +155,8 @@ def main():
     )
     parser.add_argument("--ssid", default=DEFAULT_SSID,
                         help=f"network to join (default: {DEFAULT_SSID!r})")
+    parser.add_argument("--password", default=DEFAULT_PASSWORD,
+                        help="network password (default: the board's own)")
     parser.add_argument("--interface", metavar="NAME",
                         help="Wi-Fi adapter name (default: autodetect; see --list-interfaces)")
     parser.add_argument("--timeout", type=float, default=15.0,
@@ -192,7 +200,7 @@ def main():
             print(f"Warning: {args.ssid!r} isn't currently visible to {iface!r} "
                   "-- is the board powered on and in range? Trying anyway...")
 
-        add_profile(args.ssid, iface)
+        add_profile(args.ssid, args.password, iface)
         result = run_netsh(
             "wlan", "connect", f"name={args.ssid}", f"ssid={args.ssid}", f"interface={iface}"
         )

@@ -7,7 +7,7 @@
 // fixture (its channels 8-15), driven over PWM by the PCA9685. It doesn't
 // speak Art-Net itself, and there's no wire to MULTIPLEX_8266 either: this
 // board joins MULTIPLEX_8266's own SoftAP as a Wi-Fi station (the same
-// open network QLC+ joins for Art-Net), and the two exchange duty commands
+// WPA2 network QLC+ joins for Art-Net), and the two exchange duty commands
 // and heartbeat bytes as UDP datagrams instead of serial bytes. See
 // MULTIPLEX_8266's ARTNET_CONTROL.md for how QLC+ addresses the combined
 // fixture.
@@ -53,7 +53,8 @@ uint16_t channelLevels[NUM_CHANNELS] = {0};
 // MULTIPLEX_8266's AP always hands out 192.168.4.1 to itself (see its
 // ARTNET_CONTROL.md), so that address is fixed even though this board's own
 // address (assigned by the AP's DHCP server) isn't.
-static const char *WIFI_SSID = "MULTIPLEX_LIGHTS"; // open network, no password
+static const char *WIFI_SSID = "MULTIPLEX_LIGHTS";
+static const char *WIFI_PASSWORD = "LIGHTS123"; // must match MULTIPLEX_8266's AP_PASSWORD
 static const IPAddress MULTIPLEX_AP_IP(192, 168, 4, 1);
 static const uint16_t RELAY_HEARTBEAT_PORT = 7778; // this board -> MULTIPLEX_8266
 static const uint16_t RELAY_DUTY_PORT = 7779;      // MULTIPLEX_8266 -> this board
@@ -331,7 +332,7 @@ void setup() {
   bootFlashStatusLed();
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID); // open network; the core retries/reconnects on its own
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // the core retries/reconnects on its own
   linkUdp.begin(RELAY_DUTY_PORT);
   Serial.printf("[WIFI] joining %s...\n", WIFI_SSID);
 

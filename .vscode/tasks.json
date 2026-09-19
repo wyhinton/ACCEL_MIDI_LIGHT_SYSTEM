@@ -192,6 +192,20 @@
       "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Start Wi-Fi Auto-Reconnect",
+      "type": "shell",
+      "command": "launchctl load -w ~/Library/LaunchAgents/com.wyhinton.wifireconnect.plist && echo 'Wi-Fi auto-reconnect started (checks every 30s).'",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Stop Wi-Fi Auto-Reconnect",
+      "type": "shell",
+      "command": "launchctl unload -w ~/Library/LaunchAgents/com.wyhinton.wifireconnect.plist && echo 'Wi-Fi auto-reconnect stopped.'",
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "clear": true }
     }
   ],
   "inputs": [
